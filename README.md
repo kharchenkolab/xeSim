@@ -2,9 +2,9 @@
 
 **Procedural-mechanistic Xenium tissue simulator.**
 
-xeSim fits a generative model from a Xenium bundle and uses it to either
-*explain* the bundle (re-render through the model) or *generate* a new
-bundle (sample from the fitted priors). Every output pixel is traceable
+xeSim fits a generative model from a Xenium bundle and uses it to
+*explain* the bundle — re-rendering it through the model with full
+per-cell traceability of every pixel. Every output pixel is traceable
 to explicit per-cell biology — the renderer is bounded and cannot drift
 from the accounted-for cells.
 
@@ -27,8 +27,8 @@ Skip cellAdmix-core only if you'll always pass `--no-transcripts` to
 `fit-model` (transcript-based features — per-gene compartments, per-cell-type
 negbin counts, factor-derived gene assignment — will then be unavailable).
 
-A CUDA GPU is required for `fit-model`. Inference (`explain`, `generate`)
-works on CPU but is much slower.
+A CUDA GPU is required for `fit-model`. Inference (`explain`) works on
+CPU but is much slower.
 
 ## Quick start
 
@@ -42,9 +42,6 @@ xesim fit-model PATH/TO/BUNDLE --annotations PATH/TO/cell_types.csv \
 # Re-render the real bundle through the model (2D or 2.5D)
 xesim explain PATH/TO/BUNDLE --model my_model/ --out explained/ \
     --scene-mode 2d            # or 2.5d for z-stack output
-
-# Sample a new bundle from the fitted priors
-xesim generate --model my_model/ --out synth/ --num-scenes 4 --seed 42
 ```
 
 Outputs are written as **standard Xenium bundles** (image stack +
@@ -58,7 +55,6 @@ model = XesimModel.fit("path/to/bundle", "path/to/cell_types.csv",
                           out_dir="my_model/")
 # or load: model = XesimModel.load("my_model/")
 items = model.explain("path/to/bundle")
-items = model.generate(num_scenes=4, seed=42)
 ```
 
 ## Inspection helpers

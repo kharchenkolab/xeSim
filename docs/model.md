@@ -2,9 +2,8 @@
 
 xeSim is a **procedural-mechanistic** simulator of a Xenium tissue
 section. It fits a generative model from a single Xenium bundle, and
-then either *explains* the bundle (re-renders the same tissue through
-the model) or *generates* a brand-new bundle (samples scene state from
-the fitted priors).
+then *explains* the bundle by re-rendering the same tissue through the
+model.
 
 The design rule: **every realistic-looking pixel must be traceable to
 explicit per-cell or per-component state**. The renderer is the only
@@ -16,8 +15,8 @@ cells, or operate as a black box.
 
 ![mechanistic scene → 2D / 2.5D rendering](figures/mechanistic_render_modes.png)
 
-Internally, every render — explained or generated — flows through the
-same intermediate object, the **`MechanisticScene`**:
+Internally, every render flows through the same intermediate object,
+the **`MechanisticScene`**:
 
 - **A.** Cells of various types are placed in a 2D tissue plane, each
   with a nucleus, a sectioning state, a per-cell 3D tilt, and a list
@@ -62,12 +61,9 @@ Five stages, left to right:
    pickled.
 
 4. **Scene composition.** Builds the `MechanisticScene` shown in
-   panel A above. The scene can come from either:
-   - **`xesim explain BUNDLE`** — reuse the real bundle's cells +
-     types as the scene state (every output cell corresponds 1:1 to a
-     real cell);
-   - **`xesim generate`** — sample new cell positions and types from
-     the fitted priors (no real-bundle alignment).
+   panel A above. **`xesim explain BUNDLE`** reuses the real bundle's
+   cells + types as the scene state — every output cell corresponds
+   1:1 to a real cell.
 
 5. **Render → output.** Either the 2D or 2.5D path above. Both modes
    write the result as a **Xenium-format bundle** so it loads in

@@ -29,8 +29,8 @@ python -m pip install -e cellAdmix-core/python --no-build-isolation
 scikit-learn is required if you plan to use `--crop-selection stratified`
 (installed automatically with `[analysis]`).
 
-A CUDA GPU is required for `fit-model`. Inference (`explain`, `generate`)
-works on CPU but is much slower.
+A CUDA GPU is required for `fit-model`. Inference (`explain`) works on
+CPU but is much slower.
 
 ## 1. Get a fitted model
 
@@ -186,29 +186,6 @@ look/
 └── summary.json
 ```
 
-## 3. Generate new scenes
-
-### Plain forward (sample from priors)
-
-```bash
-xesim generate --model my_model/ --out synth/ --num-scenes 4 --seed 42
-```
-
-### Slice-guided (anchored to a real crop's tissue organization)
-
-```bash
-xesim generate --model my_model/ --out synth_guided/ \
-    --guide-bundle my_model/canonical --guide-crop crop_00011 \
-    --num-scenes 4 --seed 7
-```
-
-Slice-guided generation preserves the *composition* of the guide crop
-(per-region cell-type distribution, density) while resampling all
-individual cells. Useful for generating augmented training data with
-realistic tissue architecture.
-
-Output shape is identical to `explain`.
-
 ## Python API
 
 The same tasks are available as Python entry points:
@@ -238,16 +215,6 @@ result = build_scene(
     add_transcript_proposed=True,
 )
 # result['scenes'] list[Scene2D], result['stitched_image'] (C,H,W uint16)
-
-# Forward generation (no real bundle needed)
-items = model.generate(num_scenes=4, seed=42)
-for item in items:
-    model.write(item, "synth/")
-
-# Slice-guided generation
-items = model.generate(num_scenes=2,
-                          guide=("my_model/canonical", "crop_00011"),
-                          seed=7)
 ```
 
 The `MechanisticScene` and `MechanisticParams` types live in
