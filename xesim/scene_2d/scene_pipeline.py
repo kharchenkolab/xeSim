@@ -528,10 +528,26 @@ def build_scene(
         total_mols += int(len(owned.molecules))
         scenes_out.append(owned)
 
+    import time as _time
+    _t_start = _time.time()
+    _milestone = max(1, len(grid) // 20)    # print every 5% (was 10%)
+
     def _print_progress(done: int) -> None:
         if not progress: return
-        if done % max(1, len(grid) // 10) == 0 or done == len(grid):
-            print(f"  tile {done}/{len(grid)} done")
+        if done % _milestone != 0 and done != len(grid):
+            return
+        elapsed = _time.time() - _t_start
+        rate = done / max(elapsed, 1e-6)
+        remaining = max(0, len(grid) - done)
+        eta = remaining / max(rate, 1e-6)
+        pct = 100 * done / len(grid)
+        def _fmt(s: float) -> str:
+            if s < 60:   return f"{s:.0f}s"
+            if s < 3600: return f"{int(s//60)}m{int(s%60):02d}s"
+            return f"{int(s//3600)}h{int((s%3600)//60):02d}m"
+        print(f"  tile {done}/{len(grid)} ({pct:5.1f}%)  "
+              f"elapsed {_fmt(elapsed)}  ETA {_fmt(eta)}  "
+              f"({rate:.1f} tiles/s)", flush=True)
 
     if num_workers <= 1:
         # Serial path (default)

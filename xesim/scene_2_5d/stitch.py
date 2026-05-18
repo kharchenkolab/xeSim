@@ -269,6 +269,26 @@ def build_scene_25d(
         seed = int(rng.integers(0, 2**31 - 1))
         tile_args.append((k, (tx0, ty0, tx1, ty1), seed))
 
+    # Progress timing — emits every ~5% with elapsed + ETA
+    import time as _time
+    _t_start = _time.time()
+    _milestone = max(1, len(tile_args) // 20)
+
+    def _emit_progress(done: int, total: int, t_start: float,
+                          milestone: int) -> None:
+        if done % milestone != 0 and done != total:
+            return
+        elapsed = _time.time() - t_start
+        rate = done / max(elapsed, 1e-6)
+        eta = max(0, total - done) / max(rate, 1e-6)
+        def _fmt(s):
+            if s < 60: return f"{s:.0f}s"
+            if s < 3600: return f"{int(s//60)}m{int(s%60):02d}s"
+            return f"{int(s//3600)}h{int((s%3600)//60):02d}m"
+        print(f"  tile {done}/{total} ({100*done/total:5.1f}%)  "
+              f"elapsed {_fmt(elapsed)}  ETA {_fmt(eta)}  "
+              f"({rate:.2f} tiles/s)", flush=True)
+
     # Bundle-wide compose: cells, tilts, MRF, nucleus polygons — runs ONCE.
     print(f"[build_scene_25d] scene-first precompute over the whole region", flush=True)
     shared = precompute_scene_25d(
@@ -300,7 +320,7 @@ def build_scene_25d(
             except Exception:
                 pass
             if progress:
-                print(f"  tile {idx+1}/{len(tile_args)}", flush=True)
+                _emit_progress(idx + 1, len(tile_args), _t_start, _milestone)
     else:
         # Multiprocessing.Pool with N workers, each holding its own model
         # on GPU. 4 CUDA contexts time-share the SMs and parallelize at the
@@ -325,7 +345,7 @@ def build_scene_25d(
                 _consume(k_, bbox, dapi_zstack, focal_tile, mol, c3d)
                 done += 1
                 if progress:
-                    print(f"  tile {done}/{len(tile_args)}", flush=True)
+                    _emit_progress(done, len(tile_args), _t_start, _milestone)
 
     # Normalize focal_render by weight
     focal_render = focal_render / np.maximum(focal_weight[None, :, :], 1e-6)
