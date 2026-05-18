@@ -1,5 +1,6 @@
 # xeSim
 
+
 **Procedural-mechanistic Xenium tissue simulator.**
 
 xeSim fits a generative model from a Xenium bundle and uses it to
@@ -7,6 +8,8 @@ xeSim fits a generative model from a Xenium bundle and uses it to
 per-cell traceability of every pixel. Every output pixel is traceable
 to explicit per-cell biology — the renderer is bounded and cannot drift
 from the accounted-for cells.
+
+<img src="docs/figures/cartoon.png" alt="drawing" width="600"/>
 
 ## Install
 
