@@ -504,18 +504,48 @@ def _plot_tile_3panels(bundle_path: Path, synth_dir: Path, model_dir: Path,
     return written
 
 
+# Per-cell-type contour palette for A4. Matches the merged_annotation
+# vocabulary seen across pancreas + breast 5K models. Unknown types
+# fall back to TYPE_DEFAULT_COLOR.
+TYPE_PALETTE = {
+    "Exocrine epithelial":      "#e41a1c",
+    "Ductal/tumor epithelial":  "#377eb8",
+    "Fibroblast / CAF":         "#4daf4a",
+    "Immune":                   "#984ea3",
+    "Endothelial":              "#ff7f00",
+    "Mural / pericyte":         "#ffff33",
+    "Endocrine":                "#a65628",
+    "Epithelial":               "#e41a1c",
+    "T / NK":                   "#f781bf",
+    "Myeloid":                  "#984ea3",
+    "B / plasma":               "#fb8072",
+    "Ambiguous / low-quality":  "#999999",
+}
+TYPE_DEFAULT_COLOR = "#cccccc"
+
+
 def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
                               model_dir: Path, out_dir: Path,
-                              crop_um: float = 48.0,
-                              cells_per_type: int = 3) -> Path:
-    """A4: small hero-cell grid. Pick a few cells per cell-type from the
-    synth ground truth, crop real-bundle + synth-bundle morphology at
-    each centroid, show side-by-side. No m.render to keep this fast."""
+                              crop_um: float = 64.0,
+                              n_regions: int = 12,
+                              composition_window_um: float = 200.0,
+                              min_spatial_dist_um: float = 300.0,
+                              cells_per_type: int | None = None) -> Path:
+    """A4: compositionally distinct cell-level regions (3-column layout).
+
+    For up to ``n_regions`` cell types, pick a representative ~``crop_um``
+    window whose ``composition_window_um`` neighborhood is enriched for
+    that type. Each row shows real | rendered | rendered+contours+tx with
+    cell contours colored per type and a per-type legend below.
+
+    Replaces the older per-type 3-cell-per-row 2-column layout.
+    The ``cells_per_type`` argument is accepted for API compatibility
+    and ignored.
+    """
     import pandas as pd
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import tifffile
 
     out = Path(out_dir) / "scale_A4_cell_grid.png"
     gt_path = synth_dir / "ground_truth" / "cells_synth.parquet"
@@ -524,26 +554,61 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
     gt = pd.read_parquet(gt_path)
     if "cell_type" not in gt.columns:
         return out
-    # Pick cells per type — choose by area to make them visually meaningful
-    types_used = sorted(gt["cell_type"].dropna().unique())
+    types_used = [t for t in sorted(gt["cell_type"].dropna().unique())
+                    if t.lower() != "unknown"]
     if not types_used:
         return out
-    types_used = [t for t in types_used if t.lower() != "unknown"][:6]
-    rng = np.random.default_rng(42)
-    picks = []
-    for t in types_used:
-        sub = gt[gt["cell_type"] == t]
-        if len(sub) < cells_per_type:
-            continue
-        idx = rng.choice(len(sub), size=cells_per_type, replace=False)
-        for i in idx:
-            row = sub.iloc[i]
-            picks.append((t, float(row["centroid_x"]), float(row["centroid_y"])))
 
+    # For each candidate type, find up to K spatially-distinct windows
+    # whose composition_window_um neighborhood is most enriched for that
+    # type. K = ceil(n_regions / n_types) so we cover the diversity of
+    # cell types while still picking n_regions total.
+    import math as _math
+    picks_per_type = max(1, _math.ceil(n_regions / max(len(types_used), 1)))
+
+    half_comp = composition_window_um / 2
+    cells_xy = gt[["cell_id", "cell_type",
+                       "centroid_x", "centroid_y"]].copy()
+    cells_xy_arr = cells_xy[["centroid_x", "centroid_y"]].to_numpy()
+    types_arr = cells_xy["cell_type"].to_numpy()
+    picks: list[tuple[str, float, float, int, int]] = []
+    for t in types_used:
+        cand = cells_xy[cells_xy.cell_type == t]
+        if len(cand) < 5:
+            continue
+        # Subsample candidates for speed (max 200), then score each by
+        # the same-type fraction in its composition window. Sort by score
+        # and greedily pick top-K subject to min_spatial_dist_um from
+        # already-picked spots of any type.
+        sample = cand.sample(min(200, len(cand)), random_state=42)
+        scored: list[tuple[float, float, float, int, int]] = []
+        for _, row in sample.iterrows():
+            cx, cy = float(row.centroid_x), float(row.centroid_y)
+            in_win = ((cells_xy_arr[:, 0] >= cx - half_comp) &
+                        (cells_xy_arr[:, 0] <= cx + half_comp) &
+                        (cells_xy_arr[:, 1] >= cy - half_comp) &
+                        (cells_xy_arr[:, 1] <= cy + half_comp))
+            n = int(in_win.sum())
+            if n < 5:
+                continue
+            n_match = int(((types_arr == t) & in_win).sum())
+            frac = n_match / n
+            scored.append((frac, cx, cy, n_match, n))
+        scored.sort(key=lambda r: -r[0])
+        type_picks_taken = 0
+        for frac, cx, cy, n_match, n_tot in scored:
+            if all((cx - px)**2 + (cy - py)**2 >= min_spatial_dist_um**2
+                       for _, px, py, _, _ in picks):
+                picks.append((t, cx, cy, n_match, n_tot))
+                type_picks_taken += 1
+                if type_picks_taken >= picks_per_type:
+                    break
+        if len(picks) >= n_regions:
+            break
+    picks = picks[:n_regions]
     if not picks:
         return out
 
-    lut = _load_display_lut(model_dir)
     psz = 0.2125
     try:
         import json as _j
@@ -551,55 +616,92 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
         psz = float(m.get("pixel_size", 0.2125))
     except Exception:
         pass
-    half_px = int(round(crop_um / 2 / psz))
 
-    # Bundle bounds in pixels — read OME-TIFF header only, no data load
-    # (the breast 5K morphology is 24.5 GB; full load OOMs).
     from .scene_2d.render_tile import real_tile_image
-    from .images import ome_image_shape
-    real_p0 = bundle_path / "morphology_focus" / "morphology_focus_0000.ome.tif"
-    H, W = ome_image_shape(real_p0)
+    lut = _load_display_lut(model_dir)
     ch_names = list(CHANNEL_HUE.keys())
 
-    n_rows = len(picks)
-    # Crops 50% larger than original; figure sized so two square axes (height
-    # 2.7") pack side-by-side without internal padding. wspace=0 + label
-    # space on the left, no padding on the right.
-    fig, axes = plt.subplots(n_rows, 2, figsize=(5.8, 2.7 * n_rows),
-                               facecolor="white",
-                               gridspec_kw={"wspace": 0.0, "hspace": 0.04})
-    if n_rows == 1:
+    poly = pd.read_parquet(synth_dir / "cell_boundaries.parquet",
+                              columns=["cell_id", "vertex_x", "vertex_y"])
+    tx_path = synth_dir / "transcripts.parquet"
+    tx = (pd.read_parquet(tx_path, columns=["x_location", "y_location"])
+            if tx_path.exists() else None)
+
+    cell_to_color = dict(zip(gt.cell_id.astype(str),
+                                gt.cell_type.map(
+                                    lambda t: TYPE_PALETTE.get(t, TYPE_DEFAULT_COLOR))))
+
+    n = len(picks)
+    half = crop_um / 2
+    import math as _math
+    fig, axes = plt.subplots(n, 3, figsize=(10.5, 3.3 * n), facecolor="white",
+                              gridspec_kw={"wspace": 0.0, "hspace": 0.04})
+    if n == 1:
         axes = axes[None, :]
-    for i, (t, cx, cy) in enumerate(picks):
-        cx_px = int(round(cx / psz)); cy_px = int(round(cy / psz))
-        y0 = max(cy_px - half_px, 0); y1 = min(cy_px + half_px, H)
-        x0 = max(cx_px - half_px, 0); x1 = min(cx_px + half_px, W)
-        # Bounded reads per cell (cheap — ~48um crops).
-        bounds = (float(x0 * psz), float(x1 * psz),
-                    float(y0 * psz), float(y1 * psz))
+
+    for i, (t, cx, cy, n_match, n_tot) in enumerate(picks):
+        bounds = (float(cx - half), float(cx + half),
+                    float(cy - half), float(cy + half))
         real_c = real_tile_image(str(bundle_path),
             tile_bounds_um=bounds, pixel_size_um=psz)
         synth_c = real_tile_image(str(synth_dir),
             tile_bounds_um=bounds, pixel_size_um=psz)
         if real_c is None or synth_c is None:
             continue
-        if lut:
-            real_n = _lut_normalize(real_c, lut)
-            synth_n = _lut_normalize(synth_c, lut)
-        else:
-            real_n = real_c / max(real_c.max(), 1.0)
-            synth_n = synth_c / max(synth_c.max(), 1.0)
-        axes[i, 0].imshow(_composite_rgb(real_n, ch_names))
-        axes[i, 1].imshow(_composite_rgb(synth_n, ch_names))
-        axes[i, 0].set_ylabel(f"{t[:14]}", fontsize=10, rotation=0,
-                                ha="right", va="center", labelpad=4)
-        for a in axes[i]: a.set_xticks([]); a.set_yticks([])
-    axes[0, 0].set_title("real",  fontsize=12, fontweight="bold")
-    axes[0, 1].set_title("synth", fontsize=12, fontweight="bold")
-    fig.suptitle(f"A4. Cell-level crops — {int(crop_um)}×{int(crop_um)} µm, "
-                   f"{cells_per_type} cells/type",
-                   fontsize=11, fontweight="bold", y=0.997)
-    plt.subplots_adjust(left=0.10, right=1.0, top=0.97, bottom=0.0)
+        h = min(real_c.shape[1], synth_c.shape[1])
+        w = min(real_c.shape[2], synth_c.shape[2])
+        real_c = real_c[:, :h, :w]
+        synth_c = synth_c[:, :h, :w]
+        x0_um = _math.floor(bounds[0] / psz) * psz
+        y0_um = _math.floor(bounds[2] / psz) * psz
+        x1_um = x0_um + w * psz
+        y1_um = y0_um + h * psz
+        ext = (x0_um, x1_um, y1_um, y0_um)
+        real_n = _lut_normalize(real_c, lut) if lut else \
+                    real_c / max(real_c.max(), 1.0)
+        synth_n = _lut_normalize(synth_c, lut) if lut else \
+                    synth_c / max(synth_c.max(), 1.0)
+        axes[i, 0].imshow(_composite_rgb(real_n,  ch_names), extent=ext)
+        axes[i, 1].imshow(_composite_rgb(synth_n, ch_names), extent=ext)
+        axes[i, 2].imshow(_composite_rgb(synth_n, ch_names), extent=ext)
+        local_p = poly[(poly.vertex_x >= x0_um) & (poly.vertex_x < x1_um)
+                          & (poly.vertex_y >= y0_um) & (poly.vertex_y < y1_um)]
+        for cid, g in local_p.groupby("cell_id"):
+            color = cell_to_color.get(str(cid), TYPE_DEFAULT_COLOR)
+            axes[i, 2].plot(g.vertex_x.values, g.vertex_y.values,
+                                color=color, linewidth=0.7, alpha=0.95)
+        if tx is not None:
+            local_tx = tx[(tx.x_location >= x0_um) & (tx.x_location < x1_um)
+                              & (tx.y_location >= y0_um) & (tx.y_location < y1_um)]
+            axes[i, 2].scatter(local_tx.x_location, local_tx.y_location,
+                                  s=0.75, c="white", alpha=0.7,
+                                  marker=".", linewidths=0)
+        for a in axes[i]:
+            a.set_xlim(x0_um, x1_um); a.set_ylim(y1_um, y0_um)
+            a.set_xticks([]); a.set_yticks([])
+        axes[i, 0].set_ylabel(f"{t[:18]}\n{n_match}/{n_tot} of type",
+                                  fontsize=9, rotation=0, ha="right",
+                                  va="center", labelpad=4)
+
+    axes[0, 0].set_title("real", fontsize=12, fontweight="bold")
+    axes[0, 1].set_title("rendered", fontsize=12, fontweight="bold")
+    axes[0, 2].set_title("rendered + cells (typed) + tx",
+                            fontsize=12, fontweight="bold")
+
+    # Per-type color legend
+    present_types = sorted(set(gt["cell_type"].dropna().astype(str)))
+    legend_handles = [plt.Line2D([0], [0],
+                                       color=TYPE_PALETTE.get(t, TYPE_DEFAULT_COLOR),
+                                       lw=3, label=t)
+                          for t in present_types]
+    fig.legend(handles=legend_handles, loc="lower center",
+                  ncol=min(4, len(legend_handles)),
+                  fontsize=8, frameon=True, bbox_to_anchor=(0.5, 0.0))
+
+    fig.suptitle(f"A4. Composition-distinct regions — "
+                    f"{int(crop_um)}×{int(crop_um)} µm cell-scale crops",
+                    fontsize=11, fontweight="bold", y=0.998)
+    plt.subplots_adjust(left=0.13, right=1.0, top=0.97, bottom=0.06)
     plt.savefig(out, dpi=130, bbox_inches="tight", pad_inches=0.02,
                   facecolor="white")
     plt.close(fig)
