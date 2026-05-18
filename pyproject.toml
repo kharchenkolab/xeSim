@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xesim"
+version = "0.1.0"
+description = "Bundle-specific Xenium staining simulator prototypes."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "xeSim contributors" }
+]
+dependencies = [
+  "numpy",
+  "torch",
+]
+
+[project.optional-dependencies]
+io = [
+  "tifffile",
+  "imagecodecs",
+  "zarr",
+  "pyarrow",
+]
+analysis = [
+  "scipy",
+  "scikit-image",
+  "pandas",
+]
+test = [
+  "pytest",
+]
+dev = [
+  "pytest",
+  "tifffile",
+  "imagecodecs",
+  "zarr",
+  "pyarrow",
+]
+
+[project.scripts]
+xesim = "xesim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["xesim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

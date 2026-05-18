@@ -1,0 +1,890 @@
+"""Standard diagnostic plots produced by ``--diagnostic`` on fit-model
+and explain.
+
+Each function takes its inputs explicitly and writes a PNG (or small
+set) into ``out_dir``. Errors are caught per function so one bad plot
+doesn't take down the whole diagnostic step. Adding a new diagnostic
+means dropping a function in here and adding it to the orchestrator.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import traceback
+from pathlib import Path
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Path resolution
+
+
+def resolve_diagnostic_dir(
+    diagnostic_arg: str | None, out_dir: str | Path,
+) -> Path | None:
+    """Translate the parsed --diagnostic argument into an output directory.
+
+    ``None`` → diagnostics disabled, return None.
+    ``"auto"`` (the const used by ``nargs='?'`` with no value) →
+    ``<out_dir>/diagnostics/``.
+    Anything else → that path verbatim.
+    """
+    if diagnostic_arg is None:
+        return None
+    if diagnostic_arg == "auto":
+        diag = Path(out_dir) / "diagnostics"
+    else:
+        diag = Path(diagnostic_arg)
+    diag.mkdir(parents=True, exist_ok=True)
+    return diag
+
+
+def _safe(fn, *args, **kwargs):
+    """Run a plot function, swallow failures, return the path it wrote
+    (or None on failure). Errors print but don't abort."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print(f"[diagnostics] {fn.__name__} failed: {e}", file=sys.stderr)
+        traceback.print_exc(limit=2, file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Channel palette (matches scene_2d.realism_panel.CHANNEL_STYLE)
+
+CHANNEL_HUE = {
+    "DAPI":                       ((1.00, 0.20, 0.20), 1.0),
+    "ATP1A1/CD45/E-Cadherin":     ((0.20, 1.00, 0.30), 1.0),
+    "18S":                        ((0.30, 0.50, 1.00), 0.55),
+    "alphaSMA/Vimentin":          ((0.95, 0.40, 0.85), 0.45),
+}
+
+
+def _composite_rgb(arr_chw: np.ndarray, channel_names) -> np.ndarray:
+    """4-channel intensity stack → RGB display via the canonical hue mix."""
+    rgb = np.zeros((arr_chw.shape[1], arr_chw.shape[2], 3), dtype=np.float32)
+    for ci in range(min(len(channel_names), arr_chw.shape[0])):
+        hue, w = CHANNEL_HUE.get(channel_names[ci], ((0.8, 0.8, 0.8), 0.5))
+        intensity = np.clip(arr_chw[ci], 0, 1) * w
+        for k in range(3):
+            rgb[..., k] += intensity * hue[k]
+    p = float(np.percentile(rgb, 99))
+    if p > 0:
+        rgb = rgb / max(p, 1.0)
+    return np.clip(rgb, 0, 1)
+
+
+def _lut_normalize(arr_chw: np.ndarray, display_lut: dict) -> np.ndarray:
+    """Apply display LUT per channel — output in [0, 1]."""
+    out = np.zeros_like(arr_chw, dtype=np.float32)
+    chans = display_lut.get("channels", [])
+    for ci in range(arr_chw.shape[0]):
+        if ci < len(chans):
+            lo = float(chans[ci].get("lo", 0.0))
+            hi = float(chans[ci].get("hi", 1.0))
+            out[ci] = (arr_chw[ci] - lo) / max(hi - lo, 1e-6)
+        else:
+            p99 = float(np.percentile(arr_chw[ci][arr_chw[ci] > 0], 99)) \
+                if (arr_chw[ci] > 0).any() else 1.0
+            out[ci] = arr_chw[ci] / max(p99, 1e-6)
+    return np.clip(out, 0, 1)
+
+
+# ---------------------------------------------------------------------------
+# fit-model diagnostics
+
+
+def fit_model_diagnostics(model_dir: str | Path, bundle_path: str | Path,
+                              out_dir: Path) -> list[Path]:
+    """Standard fit-model diagnostic set."""
+    written: list[Path] = []
+    model_dir = Path(model_dir)
+    p_priors = model_dir / "priors_3d" / "nucleus_priors.json"
+    if p_priors.exists():
+        p = _safe(_plot_nucleus_prior_fit, p_priors, out_dir)
+        if p: written.append(p)
+    p_train = model_dir / "training.log"
+    if p_train.exists():
+        p = _safe(_plot_training_loss, p_train, out_dir)
+        if p: written.append(p)
+    return written
+
+
+def fit_priors_diagnostics(priors_path: str | Path,
+                              out_dir: Path) -> list[Path]:
+    p = _safe(_plot_nucleus_prior_fit, Path(priors_path), out_dir)
+    return [p] if p else []
+
+
+def _plot_nucleus_prior_fit(priors_path: Path, out_dir: Path) -> Path:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mf = json.loads(priors_path.read_text())
+    priors = mf.get("priors", {})
+    out = Path(out_dir) / "nucleus_prior_fit.png"
+    if not priors:
+        return out
+
+    q_levels = ["p10", "p25", "p50", "p75", "p90"]
+    qx = [10, 25, 50, 75, 90]
+    type_names = list(priors.keys())
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), facecolor="white")
+    cmap = plt.get_cmap("tab10")
+    for i, name in enumerate(type_names):
+        prior = priors[name]
+        emp_area = prior.get("target_area_quantiles", {})
+        emp_ar   = prior.get("target_axis_ratio_quantiles", {})
+        fd = prior.get("fit_diagnostics", {}).get("final_quantiles", {})
+        pred_area = fd.get("area", {})
+        pred_ar   = fd.get("axis_ratio", {})
+        ea  = [emp_area.get(q, np.nan) for q in q_levels]
+        pa  = [pred_area.get(q, np.nan) for q in q_levels]
+        ear = [emp_ar.get(q, np.nan) for q in q_levels]
+        par = [pred_ar.get(q, np.nan) for q in q_levels]
+        color = cmap(i % 10)
+        n = prior.get("n_train", 0)
+        axes[0].plot(qx, ea, "o-", color=color, lw=1.0, ms=4,
+                       label=f"{name[:20]} (n={n})")
+        axes[0].plot(qx, pa, "x--", color=color, lw=1.0, ms=5, alpha=0.7)
+        axes[1].plot(qx, ear, "o-", color=color, lw=1.0, ms=4)
+        axes[1].plot(qx, par, "x--", color=color, lw=1.0, ms=5, alpha=0.7)
+    axes[0].set_xlabel("quantile (%)"); axes[0].set_ylabel("2D area (µm²)")
+    axes[0].set_title("Area: solid = empirical, dashed = fitted", fontsize=9)
+    axes[0].legend(fontsize=7, loc="upper left")
+    axes[1].set_xlabel("quantile (%)"); axes[1].set_ylabel("axis ratio")
+    axes[1].set_title("Axis ratio: solid = empirical, dashed = fitted", fontsize=9)
+    fig.suptitle(
+        f"3D nucleus prior fit quality — {mf.get('n_records_used', 0):,} "
+        f"cells, {len(type_names)} types",
+        fontsize=11, fontweight="bold")
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out
+
+
+def _plot_training_loss(training_log: Path, out_dir: Path) -> Path:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import re
+    rows: list[dict] = []
+    line_re = re.compile(r"^step\s+(\d+)\s+(.+)$")
+    kv_re   = re.compile(r"(\w+)\s+(-?[\d.eE+-]+)")
+    with training_log.open() as f:
+        for line in f:
+            m = line_re.match(line.strip())
+            if not m: continue
+            kvs = dict((k, float(v)) for k, v in kv_re.findall(m.group(2)))
+            kvs["step"] = int(m.group(1))
+            rows.append(kvs)
+    out = Path(out_dir) / "training_loss.png"
+    if not rows: return out
+    steps = np.array([r["step"] for r in rows])
+    keys  = [k for k in rows[0].keys() if k != "step"]
+    fig, ax = plt.subplots(figsize=(10, 4.5), facecolor="white")
+    cmap = plt.get_cmap("tab10")
+    for i, k in enumerate(keys):
+        vals = np.array([r.get(k, np.nan) for r in rows])
+        ax.plot(steps, vals, label=k, color=cmap(i % 10), lw=1.0)
+    ax.set_xlabel("training step"); ax.set_ylabel("loss / metric")
+    ax.set_title("Renderer training trajectory", fontsize=10, fontweight="bold")
+    ax.legend(fontsize=7, ncol=3, loc="upper right"); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# explain diagnostics — orchestrator
+
+
+# Tile-scale 3-panel bench regions (real | m.render | saved bundle)
+STANDARD_REGIONS: list[tuple[tuple[float, float, float, float], str]] = [
+    ((1750, 1300, 2240, 1790), "ductal_mixed"),
+    ((6289, 2018, 6779, 2508), "endocrine_islet"),
+]
+
+
+def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
+                            model_dir: str | Path, out_dir: Path,
+                            regions: list = None) -> list[Path]:
+    """Produce the standard explain diagnostic set:
+
+      A1.  Whole-bundle thumbnail (real vs synth, low-res morphology pyramid).
+      A2.  Three mid-scale regions across the bundle (real vs synth).
+      A3.  Tile-scale 3-panel (real | m.render | saved bundle) at each
+           standard bench region.
+      A4.  Cell-level grid: hero cells per cell-type, real vs synth.
+      B5.  Per-cell-type breakdown (synth vs real cell counts + tx means).
+      B6.  Per-cell transcript-count distribution (synth vs real).
+      B7.  Per-cell area distribution (synth vs real).
+      C8.  Per-gene total-count scatter (synth vs real, log-log).
+      D10. Per-channel intensity histograms (synth vs real).
+
+    Each diagnostic runs in its own try/except so one failure doesn't
+    abort the rest.
+    """
+    bundle_path = Path(bundle_path)
+    synth_dir   = Path(synth_dir)
+    model_dir   = Path(model_dir)
+    out_dir     = Path(out_dir)
+    regions     = regions or STANDARD_REGIONS
+
+    written: list[Path] = []
+    def _add(p):
+        if p is not None: written.append(p)
+
+    # A. Real vs render across scales
+    _add(_safe(_plot_whole_bundle_thumbnail, bundle_path, synth_dir,
+                  model_dir, out_dir))
+    for p in _safe(_plot_midscale_regions, bundle_path, synth_dir,
+                       model_dir, out_dir) or []:
+        _add(p)
+    for p in _safe(_plot_tile_3panels, bundle_path, synth_dir, model_dir,
+                       out_dir, regions) or []:
+        _add(p)
+    _add(_safe(_plot_cell_level_grid, bundle_path, synth_dir, model_dir,
+                  out_dir))
+
+    # B. Population stats
+    _add(_safe(_plot_celltype_breakdown, bundle_path, synth_dir, out_dir))
+    _add(_safe(_plot_per_cell_distributions, bundle_path, synth_dir, out_dir))
+
+    # C. Transcript level
+    _add(_safe(_plot_per_gene_scatter, bundle_path, synth_dir, out_dir))
+
+    # D. Intensity
+    _add(_safe(_plot_intensity_histograms, bundle_path, synth_dir,
+                  model_dir, out_dir))
+
+    return written
+
+
+# ---------------------------------------------------------------------------
+# A. Real vs render across scales
+
+
+def _read_morph_lowres(bundle_dir: Path, pyramid_level: int = 5) -> np.ndarray:
+    """Read morphology_focus at a downsampled pyramid level. Returns
+    (C, Y, X) float32."""
+    import tifffile
+    p0 = bundle_dir / "morphology_focus" / "morphology_focus_0000.ome.tif"
+    if not p0.exists():
+        return None
+    with tifffile.TiffFile(p0) as tf:
+        series = tf.series[0]
+        levels = series.levels
+        idx = min(pyramid_level, len(levels) - 1)
+        arr = levels[idx].asarray()
+    if arr.ndim == 3 and arr.shape[0] >= 1:
+        return arr.astype(np.float32)
+    if arr.ndim == 2:
+        return arr[None, ...].astype(np.float32)
+    return None
+
+
+def _read_morph_synth_lowres(synth_dir: Path, pyramid_level: int = 5,
+                                 n_ch: int = 4) -> np.ndarray | None:
+    """Read synth morphology at a downsampled pyramid level.
+
+    For Xenium-style multi-channel OME bundles, file 0 already returns the
+    full (C, Y, X) stack at this level via OME cross-references — same
+    code path as the real reader. For older single-channel-per-file
+    bundles, falls back to reading each file's plane. If the synth bundle
+    was written with a shallower pyramid than requested, in-memory block-
+    mean downsamples by 2^deficit so callers comparing real-vs-synth at
+    the same `pyramid_level` see matched spatial scales.
+    """
+    import tifffile
+    p0 = synth_dir / "morphology_focus" / "morphology_focus_0000.ome.tif"
+    if not p0.exists():
+        return None
+    with tifffile.TiffFile(p0) as tf:
+        series = tf.series[0]
+        levels = series.levels
+        idx = min(pyramid_level, len(levels) - 1)
+        deficit = max(0, pyramid_level - idx)
+        arr = levels[idx].asarray()
+    if arr.ndim == 3 and arr.shape[0] >= 1:
+        arr = arr.astype(np.float32)
+        return _block_mean_downsample(arr, 2 ** deficit) if deficit else arr
+    # Legacy bundles: per-channel files (single-plane each).
+    arrs = [arr.astype(np.float32)]
+    for ci in range(1, n_ch):
+        p = synth_dir / "morphology_focus" / f"morphology_focus_{ci:04d}.ome.tif"
+        if not p.exists():
+            break
+        with tifffile.TiffFile(p) as tf:
+            series = tf.series[0]
+            idx_c = min(pyramid_level, len(series.levels) - 1)
+            arrs.append(series.levels[idx_c].asarray().astype(np.float32))
+    h_min = min(a.shape[0] for a in arrs); w_min = min(a.shape[1] for a in arrs)
+    arrs = [a[:h_min, :w_min] for a in arrs]
+    stacked = np.stack(arrs, axis=0)
+    return _block_mean_downsample(stacked, 2 ** deficit) if deficit else stacked
+
+
+def _block_mean_downsample(arr_chw: np.ndarray, factor: int) -> np.ndarray:
+    """Block-mean downsample (C, H, W) by `factor` along H and W.
+    Trims to a multiple of `factor` first, then averages."""
+    if factor <= 1:
+        return arr_chw
+    C, H, W = arr_chw.shape
+    H2, W2 = (H // factor) * factor, (W // factor) * factor
+    return arr_chw[:, :H2, :W2].reshape(
+        C, H2 // factor, factor, W2 // factor, factor).mean(axis=(2, 4))
+
+
+def _load_display_lut(model_dir: Path) -> dict | None:
+    from .scene_2d.render_tile import load_model_display_lut
+    return load_model_display_lut(str(model_dir))
+
+
+def _plot_whole_bundle_thumbnail(bundle_path: Path, synth_dir: Path,
+                                     model_dir: Path, out_dir: Path) -> Path:
+    """A1: whole-bundle morphology thumbnail, real vs synth, side by side."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir) / "scale_A1_whole_bundle.png"
+    lut = _load_display_lut(model_dir)
+    real = _read_morph_lowres(bundle_path, pyramid_level=5)
+    synth = _read_morph_synth_lowres(synth_dir, pyramid_level=5,
+                                          n_ch=real.shape[0] if real is not None else 4)
+    if real is None or synth is None:
+        return out
+    # Match sizes
+    h = min(real.shape[1], synth.shape[1]); w = min(real.shape[2], synth.shape[2])
+    real = real[:, :h, :w]; synth = synth[:, :h, :w]
+    if lut:
+        real_n = _lut_normalize(real, lut)
+        synth_n = _lut_normalize(synth, lut)
+    else:
+        real_n = real / max(real.max(), 1.0)
+        synth_n = synth / max(synth.max(), 1.0)
+    ch_names = (lut and [c.get("name", n) for c, n in zip(
+        lut.get("channels", []), list(CHANNEL_HUE.keys()))]) or list(CHANNEL_HUE.keys())
+    rgb_real  = _composite_rgb(real_n, ch_names)
+    rgb_synth = _composite_rgb(synth_n, ch_names)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), facecolor="white",
+                              gridspec_kw={"wspace": 0.02})
+    axes[0].imshow(rgb_real)
+    axes[0].set_title(f"real — whole bundle thumbnail",
+                        fontsize=11, fontweight="bold")
+    axes[1].imshow(rgb_synth)
+    axes[1].set_title(f"synth — whole bundle thumbnail",
+                        fontsize=11, fontweight="bold")
+    for a in axes: a.axis("off")
+    plt.savefig(out, dpi=130, bbox_inches="tight", pad_inches=0.05,
+                  facecolor="white")
+    plt.close(fig)
+    return out
+
+
+def _plot_midscale_regions(bundle_path: Path, synth_dir: Path,
+                                model_dir: Path, out_dir: Path,
+                                size_um: float = 1500.0) -> list[Path]:
+    """A2: 3 mid-scale regions (~1.5 mm) — real vs saved bundle at each."""
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import tifffile
+
+    lut = _load_display_lut(model_dir)
+    # Pick regions by cell-density: top 3 non-overlapping windows.
+    cells_real = pd.read_parquet(bundle_path / "cells.parquet",
+                                      columns=["x_centroid", "y_centroid"])
+    xmin, xmax = cells_real["x_centroid"].min(), cells_real["x_centroid"].max()
+    ymin, ymax = cells_real["y_centroid"].min(), cells_real["y_centroid"].max()
+    # Coarse grid scan
+    step = size_um / 2
+    candidates = []
+    for x0 in np.arange(xmin, xmax - size_um + 1, step):
+        for y0 in np.arange(ymin, ymax - size_um + 1, step):
+            in_box = ((cells_real.x_centroid >= x0) &
+                        (cells_real.x_centroid < x0 + size_um) &
+                        (cells_real.y_centroid >= y0) &
+                        (cells_real.y_centroid < y0 + size_um))
+            candidates.append((int(in_box.sum()), x0, y0))
+    candidates.sort(reverse=True)
+    chosen = []
+    for n, x0, y0 in candidates:
+        if all(abs(x0 - c[1]) > size_um * 0.5 or abs(y0 - c[2]) > size_um * 0.5
+                  for c in chosen):
+            chosen.append((n, x0, y0))
+        if len(chosen) >= 3:
+            break
+
+    written = []
+    psz = 0.2125
+    try:
+        import json as _j
+        m = _j.load(open(model_dir / "manifest.json"))
+        psz = float(m.get("pixel_size", 0.2125))
+    except Exception:
+        pass
+    # Bounded reads via real_tile_image — handles tiled OME-TIFF via
+    # ImageStackReader without loading the full multi-GB morphology into
+    # RAM (the breast 5K bundle is 24.5 GB; float32 load would OOM).
+    from .scene_2d.render_tile import real_tile_image
+
+    ch_names = list(CHANNEL_HUE.keys())
+    for k, (n_cells, x0, y0) in enumerate(chosen):
+        x1, y1 = x0 + size_um, y0 + size_um
+        real_c = real_tile_image(str(bundle_path),
+            tile_bounds_um=(float(x0), float(x1), float(y0), float(y1)),
+            pixel_size_um=psz)
+        synth_c = real_tile_image(str(synth_dir),
+            tile_bounds_um=(float(x0), float(x1), float(y0), float(y1)),
+            pixel_size_um=psz)
+        if real_c is None or synth_c is None:
+            continue
+        h = min(real_c.shape[1], synth_c.shape[1])
+        w = min(real_c.shape[2], synth_c.shape[2])
+        real_c = real_c[:, :h, :w]; synth_c = synth_c[:, :h, :w]
+        if lut:
+            real_n = _lut_normalize(real_c, lut); synth_n = _lut_normalize(synth_c, lut)
+        else:
+            real_n = real_c / max(real_c.max(), 1.0)
+            synth_n = synth_c / max(synth_c.max(), 1.0)
+        rgb_real = _composite_rgb(real_n, ch_names)
+        rgb_synth = _composite_rgb(synth_n, ch_names)
+        # 4× higher resolution than the previous (13, 6.6 @ dpi=130) output —
+        # mid-scale (~1500 µm) panels are useless at small size, but at 4× the
+        # cell detail is visible. ~6.8k × 3.5k px per pair.
+        fig, axes = plt.subplots(1, 2, figsize=(26, 13.2), facecolor="white",
+                                   gridspec_kw={"wspace": 0.01})
+        axes[0].imshow(rgb_real)
+        axes[0].set_title(f"real — region {k+1}\n{int(size_um)}×{int(size_um)} µm, "
+                            f"{n_cells} cells", fontsize=14, fontweight="bold")
+        axes[1].imshow(rgb_synth)
+        axes[1].set_title(f"synth — region {k+1}", fontsize=14, fontweight="bold")
+        for a in axes: a.axis("off")
+        out = Path(out_dir) / f"scale_A2_region{k+1}.png"
+        plt.savefig(out, dpi=260, bbox_inches="tight", pad_inches=0.05,
+                      facecolor="white")
+        plt.close(fig)
+        written.append(out)
+    return written
+
+
+def _plot_tile_3panels(bundle_path: Path, synth_dir: Path, model_dir: Path,
+                          out_dir: Path, regions) -> list[Path]:
+    """A3: small bench-scale 3-panel real | m.render | saved bundle."""
+    import subprocess
+    diag_script = Path(__file__).resolve().parent.parent / "misc" / "diagnostics_region_3panel.py"
+    if not diag_script.exists():
+        return []
+    written = []
+    for bounds, label in regions:
+        bounds_str = ",".join(f"{v:.0f}" for v in bounds)
+        out = Path(out_dir) / f"scale_A3_{label}.png"
+        try:
+            subprocess.run(
+                [sys.executable, str(diag_script),
+                 "--bundle", str(bundle_path),
+                 "--synth", str(synth_dir),
+                 "--model", str(model_dir),
+                 "--region", bounds_str,
+                 "--out", str(out)],
+                check=True, capture_output=True, text=True)
+            written.append(out)
+        except subprocess.CalledProcessError as e:
+            print(f"[diagnostics] tile {label} failed: {e.stderr.strip()[-200:]}",
+                  file=sys.stderr)
+    return written
+
+
+def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
+                              model_dir: Path, out_dir: Path,
+                              crop_um: float = 48.0,
+                              cells_per_type: int = 3) -> Path:
+    """A4: small hero-cell grid. Pick a few cells per cell-type from the
+    synth ground truth, crop real-bundle + synth-bundle morphology at
+    each centroid, show side-by-side. No m.render to keep this fast."""
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import tifffile
+
+    out = Path(out_dir) / "scale_A4_cell_grid.png"
+    gt_path = synth_dir / "ground_truth" / "cells_synth.parquet"
+    if not gt_path.exists():
+        return out
+    gt = pd.read_parquet(gt_path)
+    if "cell_type" not in gt.columns:
+        return out
+    # Pick cells per type — choose by area to make them visually meaningful
+    types_used = sorted(gt["cell_type"].dropna().unique())
+    if not types_used:
+        return out
+    types_used = [t for t in types_used if t.lower() != "unknown"][:6]
+    rng = np.random.default_rng(42)
+    picks = []
+    for t in types_used:
+        sub = gt[gt["cell_type"] == t]
+        if len(sub) < cells_per_type:
+            continue
+        idx = rng.choice(len(sub), size=cells_per_type, replace=False)
+        for i in idx:
+            row = sub.iloc[i]
+            picks.append((t, float(row["centroid_x"]), float(row["centroid_y"])))
+
+    if not picks:
+        return out
+
+    lut = _load_display_lut(model_dir)
+    psz = 0.2125
+    try:
+        import json as _j
+        m = _j.load(open(model_dir / "manifest.json"))
+        psz = float(m.get("pixel_size", 0.2125))
+    except Exception:
+        pass
+    half_px = int(round(crop_um / 2 / psz))
+
+    # Bundle bounds in pixels — read OME-TIFF header only, no data load
+    # (the breast 5K morphology is 24.5 GB; full load OOMs).
+    from .scene_2d.render_tile import real_tile_image
+    from .images import ome_image_shape
+    real_p0 = bundle_path / "morphology_focus" / "morphology_focus_0000.ome.tif"
+    H, W = ome_image_shape(real_p0)
+    ch_names = list(CHANNEL_HUE.keys())
+
+    n_rows = len(picks)
+    # Crops 50% larger than original; figure sized so two square axes (height
+    # 2.7") pack side-by-side without internal padding. wspace=0 + label
+    # space on the left, no padding on the right.
+    fig, axes = plt.subplots(n_rows, 2, figsize=(5.8, 2.7 * n_rows),
+                               facecolor="white",
+                               gridspec_kw={"wspace": 0.0, "hspace": 0.04})
+    if n_rows == 1:
+        axes = axes[None, :]
+    for i, (t, cx, cy) in enumerate(picks):
+        cx_px = int(round(cx / psz)); cy_px = int(round(cy / psz))
+        y0 = max(cy_px - half_px, 0); y1 = min(cy_px + half_px, H)
+        x0 = max(cx_px - half_px, 0); x1 = min(cx_px + half_px, W)
+        # Bounded reads per cell (cheap — ~48um crops).
+        bounds = (float(x0 * psz), float(x1 * psz),
+                    float(y0 * psz), float(y1 * psz))
+        real_c = real_tile_image(str(bundle_path),
+            tile_bounds_um=bounds, pixel_size_um=psz)
+        synth_c = real_tile_image(str(synth_dir),
+            tile_bounds_um=bounds, pixel_size_um=psz)
+        if real_c is None or synth_c is None:
+            continue
+        if lut:
+            real_n = _lut_normalize(real_c, lut)
+            synth_n = _lut_normalize(synth_c, lut)
+        else:
+            real_n = real_c / max(real_c.max(), 1.0)
+            synth_n = synth_c / max(synth_c.max(), 1.0)
+        axes[i, 0].imshow(_composite_rgb(real_n, ch_names))
+        axes[i, 1].imshow(_composite_rgb(synth_n, ch_names))
+        axes[i, 0].set_ylabel(f"{t[:14]}", fontsize=10, rotation=0,
+                                ha="right", va="center", labelpad=4)
+        for a in axes[i]: a.set_xticks([]); a.set_yticks([])
+    axes[0, 0].set_title("real",  fontsize=12, fontweight="bold")
+    axes[0, 1].set_title("synth", fontsize=12, fontweight="bold")
+    fig.suptitle(f"A4. Cell-level crops — {int(crop_um)}×{int(crop_um)} µm, "
+                   f"{cells_per_type} cells/type",
+                   fontsize=11, fontweight="bold", y=0.997)
+    plt.subplots_adjust(left=0.10, right=1.0, top=0.97, bottom=0.0)
+    plt.savefig(out, dpi=130, bbox_inches="tight", pad_inches=0.02,
+                  facecolor="white")
+    plt.close(fig)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# B. Population stats
+
+
+def _plot_celltype_breakdown(bundle_path: Path, synth_dir: Path,
+                                  out_dir: Path) -> Path:
+    """B5: synth vs real cell counts + mean tx per type (horizontal bars)."""
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir) / "stats_B5_celltype_breakdown.png"
+    gt = pd.read_parquet(synth_dir / "ground_truth" / "cells_synth.parquet")
+    if "cell_type" not in gt.columns:
+        return out
+    synth_counts = gt.groupby("cell_type").size().sort_values(ascending=False)
+    tx_synth = pd.read_parquet(synth_dir / "transcripts.parquet",
+                                    columns=["cell_id"])
+    cell2type = dict(zip(gt["cell_id"].astype(str), gt["cell_type"]))
+    tx_synth["cell_type"] = tx_synth["cell_id"].astype(str).map(cell2type)
+    synth_tx_per_type = tx_synth.groupby("cell_type").size()
+
+    # Real: look up annotation
+    real_ann = None
+    cand = [bundle_path.parent / "annotations" / "annotation.csv.gz",
+              bundle_path / "annotations" / "annotation.csv.gz"]
+    for c in cand:
+        if c.exists():
+            real_ann = pd.read_csv(c, compression="infer"); break
+    real_counts = pd.Series(dtype=int)
+    real_tx_per_type = pd.Series(dtype=int)
+    if real_ann is not None:
+        col_type = ("merged_annotation" if "merged_annotation" in real_ann.columns
+                       else real_ann.columns[-1])
+        real_counts = real_ann.groupby(col_type).size()
+        # tx classification: use cell_id → type lookup (only for assigned)
+        real_id2type = dict(zip(real_ann["cell_id"].astype(str), real_ann[col_type]))
+        try:
+            tx_r = pd.read_parquet(bundle_path / "transcripts.parquet",
+                                        columns=["cell_id", "qv"])
+            tx_r = tx_r[tx_r.qv >= 20]
+            tx_r["cell_type"] = tx_r["cell_id"].astype(str).map(real_id2type)
+            real_tx_per_type = tx_r.groupby("cell_type").size()
+        except Exception:
+            pass
+
+    types = list(synth_counts.index)
+    if not types: return out
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, max(3, 0.5 * len(types) + 1.5)),
+                               facecolor="white", gridspec_kw={"wspace": 0.32})
+    y = np.arange(len(types))
+    sc = [synth_counts.get(t, 0) for t in types]
+    rc = [real_counts.get(t, 0)  for t in types]
+    axes[0].barh(y - 0.20, rc, 0.40, color="#aa5555", label="real", alpha=0.85)
+    axes[0].barh(y + 0.20, sc, 0.40, color="#3a6fb0", label="synth", alpha=0.85)
+    axes[0].set_yticks(y); axes[0].set_yticklabels([t[:24] for t in types],
+                                                          fontsize=9)
+    axes[0].invert_yaxis()
+    axes[0].set_xlabel("cell count"); axes[0].set_title(
+        "Cells per type", fontsize=10, fontweight="bold")
+    axes[0].legend(fontsize=8, loc="lower right")
+    axes[0].grid(axis="x", alpha=0.25)
+
+    s_tx = [synth_tx_per_type.get(t, 0) / max(synth_counts.get(t, 1), 1)
+              for t in types]
+    r_tx = [real_tx_per_type.get(t, 0) / max(real_counts.get(t, 1), 1)
+              for t in types]
+    axes[1].barh(y - 0.20, r_tx, 0.40, color="#aa5555", label="real", alpha=0.85)
+    axes[1].barh(y + 0.20, s_tx, 0.40, color="#3a6fb0", label="synth", alpha=0.85)
+    axes[1].set_yticks(y); axes[1].set_yticklabels([])
+    axes[1].invert_yaxis()
+    axes[1].set_xlabel("mean transcripts / cell")
+    axes[1].set_title("Mean tx per cell", fontsize=10, fontweight="bold")
+    axes[1].legend(fontsize=8, loc="lower right")
+    axes[1].grid(axis="x", alpha=0.25)
+    fig.suptitle(f"B5. Population breakdown — {gt.shape[0]:,} synth cells",
+                   fontsize=11, fontweight="bold")
+    plt.tight_layout(rect=(0, 0, 1, 0.95))
+    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out
+
+
+def _plot_per_cell_distributions(bundle_path: Path, synth_dir: Path,
+                                       out_dir: Path) -> Path:
+    """B6 + B7: per-cell transcript-count histogram and per-cell area
+    histogram, both real vs synth on the same axes (log-y)."""
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir) / "stats_B6_B7_per_cell_distributions.png"
+    tx_s = pd.read_parquet(synth_dir / "transcripts.parquet",
+                                columns=["cell_id"])
+    s_per_cell = tx_s[tx_s.cell_id != "UNASSIGNED"].groupby("cell_id").size()
+    cells_s = pd.read_parquet(synth_dir / "cells.parquet",
+                                  columns=["cell_id", "cell_area"])
+    s_area = cells_s["cell_area"]
+
+    tx_r = pd.read_parquet(bundle_path / "transcripts.parquet",
+                                columns=["cell_id", "qv"])
+    tx_r = tx_r[tx_r.qv >= 20]
+    r_per_cell = tx_r[tx_r.cell_id != "UNASSIGNED"].groupby("cell_id").size()
+    try:
+        cells_r = pd.read_parquet(bundle_path / "cells.parquet",
+                                       columns=["cell_id", "cell_area"])
+        r_area = cells_r["cell_area"]
+    except Exception:
+        r_area = None
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), facecolor="white",
+                               gridspec_kw={"wspace": 0.27})
+    # B6: tx per cell
+    bins = np.logspace(0, np.log10(max(r_per_cell.max(), s_per_cell.max())+1), 60)
+    axes[0].hist(r_per_cell, bins=bins, alpha=0.55, color="#aa5555",
+                   label=f"real (n={len(r_per_cell):,})", log=True, density=True)
+    axes[0].hist(s_per_cell, bins=bins, alpha=0.55, color="#3a6fb0",
+                   label=f"synth (n={len(s_per_cell):,})", log=True, density=True)
+    axes[0].set_xscale("log"); axes[0].set_xlabel("transcripts per cell")
+    axes[0].set_ylabel("density (log)")
+    axes[0].set_title(
+        f"B6. Per-cell tx: synth max={s_per_cell.max()}, real max={r_per_cell.max()}",
+        fontsize=9, fontweight="bold")
+    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.25)
+
+    # B7: cell area
+    if r_area is not None:
+        bins = np.linspace(0, max(r_area.quantile(0.99),
+                                       s_area.quantile(0.99)), 60)
+        axes[1].hist(r_area, bins=bins, alpha=0.55, color="#aa5555",
+                       label="real", log=True, density=True)
+        axes[1].hist(s_area, bins=bins, alpha=0.55, color="#3a6fb0",
+                       label="synth", log=True, density=True)
+    else:
+        bins = np.linspace(0, s_area.quantile(0.99), 60)
+        axes[1].hist(s_area, bins=bins, alpha=0.55, color="#3a6fb0",
+                       label="synth", log=True, density=True)
+    axes[1].set_xlabel("cell area (µm²)"); axes[1].set_ylabel("density (log)")
+    axes[1].set_title("B7. Per-cell area", fontsize=9, fontweight="bold")
+    axes[1].legend(fontsize=8); axes[1].grid(alpha=0.25)
+
+    plt.tight_layout(); plt.savefig(out, dpi=130, bbox_inches="tight",
+                                          facecolor="white")
+    plt.close(fig); return out
+
+
+# ---------------------------------------------------------------------------
+# C. Transcript level
+
+
+def _plot_per_gene_scatter(bundle_path: Path, synth_dir: Path,
+                                out_dir: Path) -> Path:
+    """C8: per-gene total count, synth vs real, log-log scatter."""
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir) / "stats_C8_per_gene_scatter.png"
+    tx_s = pd.read_parquet(synth_dir / "transcripts.parquet",
+                                columns=["feature_name"]) \
+        if "feature_name" in pd.read_parquet(synth_dir / "transcripts.parquet").columns \
+        else pd.read_parquet(synth_dir / "transcripts.parquet",
+                                columns=["gene"])
+    gene_col_s = "feature_name" if "feature_name" in tx_s.columns else "gene"
+    gene_s = tx_s[gene_col_s].value_counts()
+
+    tx_r = pd.read_parquet(bundle_path / "transcripts.parquet",
+                                columns=["feature_name", "qv"]) \
+        if "feature_name" in pd.read_parquet(bundle_path / "transcripts.parquet").columns \
+        else pd.read_parquet(bundle_path / "transcripts.parquet",
+                                columns=["gene", "qv"])
+    gene_col_r = "feature_name" if "feature_name" in tx_r.columns else "gene"
+    tx_r = tx_r[tx_r.qv >= 20]
+    gene_r = tx_r[gene_col_r].value_counts()
+
+    genes = sorted(set(gene_s.index) | set(gene_r.index))
+    rs = np.array([gene_r.get(g, 0) for g in genes], dtype=float)
+    ss = np.array([gene_s.get(g, 0) for g in genes], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(6, 6), facecolor="white")
+    mask = (rs > 0) & (ss > 0)
+    ax.scatter(rs[mask], ss[mask], s=8, alpha=0.65, color="#3a6fb0",
+                 edgecolor="none")
+    lo = 1.0
+    hi = max(rs.max(), ss.max()) * 1.5
+    ax.plot([lo, hi], [lo, hi], "k--", lw=0.8, alpha=0.6, label="y = x")
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_xlabel("real total count per gene (log)")
+    ax.set_ylabel("synth total count per gene (log)")
+    ax.set_title(f"C8. Per-gene counts: {mask.sum()} genes "
+                   f"(real {rs.sum():,.0f} tx, synth {ss.sum():,.0f} tx)",
+                   fontsize=10, fontweight="bold")
+    ax.legend(loc="upper left", fontsize=8); ax.grid(alpha=0.3, which="both")
+    plt.tight_layout(); plt.savefig(out, dpi=130, bbox_inches="tight",
+                                          facecolor="white")
+    plt.close(fig); return out
+
+
+# ---------------------------------------------------------------------------
+# D. Intensity
+
+
+def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
+                                     model_dir: Path, out_dir: Path,
+                                     region: tuple = (1750, 1300, 2240, 1790)
+                                     ) -> Path:
+    """D10: per-channel pixel-intensity histograms, real vs synth, log-y.
+    Sampled at a single tile-scale region (the ductal bench)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import tifffile
+    import json as _j
+
+    out = Path(out_dir) / "stats_D10_intensity_histograms.png"
+    psz = 0.2125
+    try:
+        psz = float(_j.load(open(model_dir / "manifest.json")).get(
+            "pixel_size", 0.2125))
+    except Exception:
+        pass
+    xmin, ymin, xmax, ymax = region
+    # Bounded reads — avoid loading multi-GB full morphology to RAM
+    # (24.5 GB on the breast 5K bundle; full load OOMs).
+    from .scene_2d.render_tile import real_tile_image
+    bounds = (float(xmin), float(xmax), float(ymin), float(ymax))
+    real = real_tile_image(str(bundle_path),
+        tile_bounds_um=bounds, pixel_size_um=psz)
+    synth = real_tile_image(str(synth_dir),
+        tile_bounds_um=bounds, pixel_size_um=psz)
+    if real is None or synth is None:
+        return out
+    h = min(real.shape[1], synth.shape[1]); w = min(real.shape[2], synth.shape[2])
+    real = real[:, :h, :w]; synth = synth[:, :h, :w]
+
+    n_ch = real.shape[0]
+    names = list(CHANNEL_HUE.keys())[:n_ch]
+    fig, axes = plt.subplots(1, n_ch, figsize=(4.5 * n_ch, 4),
+                               facecolor="white")
+    if n_ch == 1: axes = [axes]
+    for ci in range(n_ch):
+        rf = real[ci].ravel(); sf = synth[ci].ravel()
+        upper = max(rf.max(), sf.max(), 10)
+        bins = np.logspace(0, np.log10(upper), 80)
+        axes[ci].hist(rf, bins=bins, alpha=0.55, color="#aa5555",
+                        label="real", log=True, density=True)
+        axes[ci].hist(sf, bins=bins, alpha=0.55, color="#3a6fb0",
+                        label="synth", log=True, density=True)
+        # Quantified p50 / p99 lines so the gap is readable, not just visual.
+        rp50, rp99 = np.percentile(rf, 50), np.percentile(rf, 99)
+        sp50, sp99 = np.percentile(sf, 50), np.percentile(sf, 99)
+        axes[ci].axvline(rp50, color="#aa5555", ls="--", lw=1.0, alpha=0.8)
+        axes[ci].axvline(rp99, color="#aa5555", ls=":", lw=1.0, alpha=0.8)
+        axes[ci].axvline(sp50, color="#3a6fb0", ls="--", lw=1.0, alpha=0.8)
+        axes[ci].axvline(sp99, color="#3a6fb0", ls=":", lw=1.0, alpha=0.8)
+        axes[ci].set_xscale("log"); axes[ci].set_title(
+            f"{names[ci]}\np50 real={rp50:.0f} synth={sp50:.0f} | "
+            f"p99 real={rp99:.0f} synth={sp99:.0f}", fontsize=9)
+        axes[ci].set_xlabel("intensity (uint16)")
+        if ci == 0: axes[ci].set_ylabel("density (log)")
+        axes[ci].legend(fontsize=8); axes[ci].grid(alpha=0.25, which="both")
+    fig.suptitle(
+        f"D10. Per-channel intensity histograms — ductal bench region "
+        f"({int(xmax-xmin)}×{int(ymax-ymin)} µm)",
+        fontsize=11, fontweight="bold")
+    plt.tight_layout(rect=(0, 0, 1, 0.95))
+    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
+    plt.close(fig); return out
+
+
+__all__ = [
+    "resolve_diagnostic_dir",
+    "fit_model_diagnostics",
+    "fit_priors_diagnostics",
+    "explain_diagnostics",
+    "STANDARD_REGIONS",
+]
