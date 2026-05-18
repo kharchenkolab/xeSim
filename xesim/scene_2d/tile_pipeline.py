@@ -214,12 +214,25 @@ def _emit_molecules(
     mech_scene: MechanisticScene,
     transcripts_priors: dict[str, Any],
     rng: np.random.Generator,
+    *,
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> pd.DataFrame:
-    """Emit molecules per cell via the existing transcripts.sample_scene_transcripts.
+    """Emit molecules per cell. Dispatches between the legacy cellAdmix-fit
+    backend (``transcripts.sample_scene_transcripts``) and the STpuppeteer
+    backend (``emission_stpuppeteer.emit_2d``).
 
     Returns DataFrame with `(x, y, gene, true_cell_id, is_ghost, true_factor, qv)`
     plus a `source_cell_type` for tracking.
     """
+    if emission_backend == "stpuppeteer":
+        from ..emission_stpuppeteer import emit_2d
+        return emit_2d(
+            scene=mech_scene,
+            stpuppeteer_config=stpuppeteer_config,
+            rng=rng,
+        )
+
     from ..transcripts import sample_scene_transcripts
     import os as _os
     # Per-cell tx-rate calibration. Precedence (highest first):
@@ -274,6 +287,8 @@ def build_tile(
     ghost_mol_count_mu: float = 10.0,
     ghost_mol_count_dispersion: float = 1.0,
     annotation_path: str | None = None,
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> Scene2D:
     """Compose + emit a tile-level synth scene.
 
@@ -412,6 +427,8 @@ def build_tile(
         mech_scene=mech_scene,
         transcripts_priors=model.transcripts_priors,
         rng=rng,
+        emission_backend=emission_backend,
+        stpuppeteer_config=stpuppeteer_config,
     )
 
     return Scene2D(

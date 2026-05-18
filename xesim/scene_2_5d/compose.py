@@ -48,6 +48,8 @@ def compose_region_scene_25d(
     rescale_dapi: bool = True,        # per-tile p99 rescaling; OFF in stitch mode
     cell_pad_um: float = 15.0,        # include cells whose centroid is up to this far OUTSIDE the tile (body protrudes in)
     model_dir: str | Path | None = None,  # for nucleus-priors auto-discover in initialize_tilts
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> Compose25DResult:
     """Compose a 2.5D scene over `region_bounds_um` and render multi-z DAPI."""
     from ..xenium import resolve_bundle
@@ -277,22 +279,35 @@ def compose_region_scene_25d(
                        and not c.cell_id.startswith("__unobs_")]
     if progress: print(f"[compose_25d] emit 3D molecules from {len(owned_records)}/"
                           f"{len(cells_records)} cells (halo cells skipped)")
-    tx_priors = getattr(model, "transcripts_priors", None)
-    if tx_priors is not None:
-        molecules = emit_molecules_3d_from_priors(
-            owned_records, cl_3d, nl_3d,
+    if emission_backend == "stpuppeteer":
+        from ..emission_stpuppeteer import emit_3d as _emit_3d_stpuppeteer
+        molecules = _emit_3d_stpuppeteer(
+            cells_records=owned_records,
+            cell_label_3d=cl_3d,
+            nucleus_label_3d=nl_3d,
             z_slices_um=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            transcripts_priors=tx_priors,
-            tx_rate_scale=1.0,
+            tile_origin_um=(xmin, ymin),
+            pixel_size_um=psz,
+            stpuppeteer_config=stpuppeteer_config,
             rng=rng,
         )
     else:
-        molecules = emit_molecules_3d(
-            owned_records, stack, z_slices=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            default_count_per_cell=default_mol_per_cell, rng=rng,
-        )
+        tx_priors = getattr(model, "transcripts_priors", None)
+        if tx_priors is not None:
+            molecules = emit_molecules_3d_from_priors(
+                owned_records, cl_3d, nl_3d,
+                z_slices_um=z_slices.tolist(),
+                tile_origin_um=(xmin, ymin), pixel_size_um=psz,
+                transcripts_priors=tx_priors,
+                tx_rate_scale=1.0,
+                rng=rng,
+            )
+        else:
+            molecules = emit_molecules_3d(
+                owned_records, stack, z_slices=z_slices.tolist(),
+                tile_origin_um=(xmin, ymin), pixel_size_um=psz,
+                default_count_per_cell=default_mol_per_cell, rng=rng,
+            )
 
     # 10. cells_3d table for ground truth
     cells_3d_rows = []

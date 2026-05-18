@@ -386,6 +386,8 @@ def build_scene(
     num_workers: int = 1,
     model_path: str | None = None,
     device: str = "cuda",
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> dict[str, Any]:
     """Build + render a multi-tile scene over ``scene_bounds_um``.
 
@@ -493,6 +495,8 @@ def build_scene(
             sample_molecules=True,
             rng=tile_rng,
             background_mask_sigma=3.0,
+            emission_backend=emission_backend,
+            stpuppeteer_config=stpuppeteer_config,
         )
         return idx, res
 
@@ -583,6 +587,8 @@ def build_scene(
             "add_transcript_proposed": add_transcript_proposed,
             "noise_fraction": noise_fraction,
             "ghost_count_scale": ghost_count_scale,
+            "emission_backend": emission_backend,
+            "stpuppeteer_config": stpuppeteer_config,
         }
         with ctx.Pool(processes=num_workers,
                         initializer=_worker_init_2d,

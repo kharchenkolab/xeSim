@@ -42,6 +42,8 @@ class SharedScene25D:
     scene_bounds_um: tuple[float, float, float, float]
     annotation_path: str | None
     imaged_depth_um: float
+    emission_backend: str = "legacy"
+    stpuppeteer_config: str | None = None
 
 
 def precompute_scene_25d(
@@ -59,6 +61,8 @@ def precompute_scene_25d(
     rng: np.random.Generator | None = None,
     progress: bool = True,
     model_dir: str | Path | None = None,
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> SharedScene25D:
     """Bundle-wide preparation. Runs once before per-tile rendering."""
     from ..xenium import resolve_bundle
@@ -199,6 +203,8 @@ def precompute_scene_25d(
         scene_bounds_um=tuple(scene_bounds_um),
         annotation_path=str(annotation_path) if annotation_path else None,
         imaged_depth_um=imaged_depth_um,
+        emission_backend=emission_backend,
+        stpuppeteer_config=stpuppeteer_config,
     )
 
 
@@ -327,22 +333,35 @@ def render_tile_from_shared(
     # real gene panel) when the model carries transcripts_priors;
     # otherwise fall back to the flat-count stub.
     owned_records = [c for c in local_cells if c.cell_id in owned_local_ids]
-    tx_priors = getattr(model, "transcripts_priors", None)
-    if tx_priors is not None:
-        molecules = emit_molecules_3d_from_priors(
-            owned_records, cl_3d, nl_3d,
+    if shared.emission_backend == "stpuppeteer":
+        from ..emission_stpuppeteer import emit_3d as _emit_3d_stpuppeteer
+        molecules = _emit_3d_stpuppeteer(
+            cells_records=owned_records,
+            cell_label_3d=cl_3d,
+            nucleus_label_3d=nl_3d,
             z_slices_um=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            transcripts_priors=tx_priors,
-            tx_rate_scale=1.0,
+            tile_origin_um=(xmin, ymin),
+            pixel_size_um=psz,
+            stpuppeteer_config=shared.stpuppeteer_config,
             rng=rng,
         )
     else:
-        molecules = emit_molecules_3d(
-            owned_records, stack, z_slices=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            default_count_per_cell=default_mol_per_cell, rng=rng,
-        )
+        tx_priors = getattr(model, "transcripts_priors", None)
+        if tx_priors is not None:
+            molecules = emit_molecules_3d_from_priors(
+                owned_records, cl_3d, nl_3d,
+                z_slices_um=z_slices.tolist(),
+                tile_origin_um=(xmin, ymin), pixel_size_um=psz,
+                transcripts_priors=tx_priors,
+                tx_rate_scale=1.0,
+                rng=rng,
+            )
+        else:
+            molecules = emit_molecules_3d(
+                owned_records, stack, z_slices=z_slices.tolist(),
+                tile_origin_um=(xmin, ymin), pixel_size_um=psz,
+                default_count_per_cell=default_mol_per_cell, rng=rng,
+            )
 
     # 8. cells_3d table — only the cells we OWN (centroid strictly in tile);
     # the stitcher will dedupe across tiles
@@ -484,23 +503,36 @@ def prepare_tile_25d(
     # per-type negbin counts + EDT-3D compartment placement + real gene
     # panel. Falls back to flat-count stub when transcripts_priors absent.
     owned_records = [c for c in local_cells if c.cell_id in owned_local_ids]
-    tx_priors = getattr(model, "transcripts_priors", None)
-    if tx_priors is not None:
-        from .emit_molecules_priors import emit_molecules_3d_from_priors
-        molecules = emit_molecules_3d_from_priors(
-            owned_records, cl_3d, nl_3d,
+    if shared.emission_backend == "stpuppeteer":
+        from ..emission_stpuppeteer import emit_3d as _emit_3d_stpuppeteer
+        molecules = _emit_3d_stpuppeteer(
+            cells_records=owned_records,
+            cell_label_3d=cl_3d,
+            nucleus_label_3d=nl_3d,
             z_slices_um=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            transcripts_priors=tx_priors,
-            tx_rate_scale=1.0,
+            tile_origin_um=(xmin, ymin),
+            pixel_size_um=psz,
+            stpuppeteer_config=shared.stpuppeteer_config,
             rng=rng,
         )
     else:
-        molecules = emit_molecules_3d(
-            owned_records, stack, z_slices=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            default_count_per_cell=default_mol_per_cell, rng=rng,
-        )
+        tx_priors = getattr(model, "transcripts_priors", None)
+        if tx_priors is not None:
+            from .emit_molecules_priors import emit_molecules_3d_from_priors
+            molecules = emit_molecules_3d_from_priors(
+                owned_records, cl_3d, nl_3d,
+                z_slices_um=z_slices.tolist(),
+                tile_origin_um=(xmin, ymin), pixel_size_um=psz,
+                transcripts_priors=tx_priors,
+                tx_rate_scale=1.0,
+                rng=rng,
+            )
+        else:
+            molecules = emit_molecules_3d(
+                owned_records, stack, z_slices=z_slices.tolist(),
+                tile_origin_um=(xmin, ymin), pixel_size_um=psz,
+                default_count_per_cell=default_mol_per_cell, rng=rng,
+            )
 
     # Build cells_3d_df from owned cells (centroid strictly in tile)
     cells_3d_cols = ["cell_id", "cell_idx", "cell_type",

@@ -117,6 +117,8 @@ def explain_region(
     background_mask_sigma: float | None = 3.0,
     tile_render_px: int | None = None,
     use_bridge_grid: bool = True,
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> ExplainRegionResult:
     """Render a real-bundle region under the mechanistic model.
 
@@ -595,10 +597,15 @@ def explain_region(
         "x": [], "y": [], "gene": [], "true_cell_id": [],
         "is_ghost": [], "true_factor": [], "qv": [],
     })
-    if sample_molecules and model.transcripts_priors is not None:
+    if sample_molecules and (model.transcripts_priors is not None
+                                or emission_backend == "stpuppeteer"):
         from .tile_pipeline import _emit_molecules
         try:
-            molecules = _emit_molecules(mech, model.transcripts_priors, rng)
+            molecules = _emit_molecules(
+                mech, model.transcripts_priors, rng,
+                emission_backend=emission_backend,
+                stpuppeteer_config=stpuppeteer_config,
+            )
         except Exception as e:
             print(f"[explain_region] molecule sampling failed: {e}")
 

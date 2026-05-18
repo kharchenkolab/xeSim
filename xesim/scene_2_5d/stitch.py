@@ -120,6 +120,8 @@ def build_scene_25d(
     device: str = "cuda",
     compile_renderer: bool = False,
     model_dir: str | Path | None = None,  # for nucleus-priors auto-discover
+    emission_backend: str = "legacy",
+    stpuppeteer_config: str | None = None,
 ) -> StitchResult:
     """Build a 2.5D scene over `scene_bounds_um` by tiling + stitching.
 
@@ -220,6 +222,8 @@ def build_scene_25d(
             progress=False,
             rescale_dapi=False,    # disable per-tile rescale; we'll do global after stitch
             model_dir=model_dir,
+            emission_backend=emission_backend,
+            stpuppeteer_config=stpuppeteer_config,
         )
         return (k, (tx0, ty0, tx1, ty1),
                 res.dapi_zstack.astype(np.float32, copy=False),
@@ -308,6 +312,8 @@ def build_scene_25d(
         rng=np.random.default_rng(int(rng.integers(0, 2**31 - 1))),
         progress=progress,
         model_dir=model_dir,
+        emission_backend=emission_backend,
+        stpuppeteer_config=stpuppeteer_config,
     )
 
     if num_workers <= 1:

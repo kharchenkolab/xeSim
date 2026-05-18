@@ -160,6 +160,13 @@ def _explain(args: argparse.Namespace) -> None:
     if args.tile is not None and args.region is not None:
         raise SystemExit("--tile and --region are mutually exclusive")
 
+    # Validate emission backend
+    if getattr(args, "emission_backend", "legacy") == "stpuppeteer":
+        if not getattr(args, "stpuppeteer_config", None):
+            raise SystemExit(
+                "--emission-backend stpuppeteer requires --stpuppeteer-config PATH"
+            )
+
     # 2.5D dispatch — independent path
     if getattr(args, "scene_mode", "2d") == "2.5d":
         return _explain_25d(args)
@@ -246,6 +253,8 @@ def _explain_tile_path(model, args, bounds, fmt, rng) -> None:
         ghost_count_scale=args.ghost_count_scale,
         sample_molecules=True,
         rng=rng,
+        emission_backend=getattr(args, "emission_backend", "legacy"),
+        stpuppeteer_config=getattr(args, "stpuppeteer_config", None),
     )
     scene = res.scene
     image = res.image
@@ -376,6 +385,8 @@ def _explain_25d(args: argparse.Namespace) -> None:
             device=args.device,
             compile_renderer=bool(getattr(args, "compile_renderer", False)),
             model_dir=str(args.model),
+            emission_backend=getattr(args, "emission_backend", "legacy"),
+            stpuppeteer_config=getattr(args, "stpuppeteer_config", None),
         )
         result = sresult.to_compose_result()
     else:
@@ -384,6 +395,8 @@ def _explain_25d(args: argparse.Namespace) -> None:
             annotation_path=args.annotation,
             rng=rng,
             model_dir=str(args.model),
+            emission_backend=getattr(args, "emission_backend", "legacy"),
+            stpuppeteer_config=getattr(args, "stpuppeteer_config", None),
         )
 
     cfg = {
@@ -435,6 +448,8 @@ def _explain_multi_scene_first(model, args, bounds, rng, nf,
         rng=rng,
         tile_render_px=tile_px,
         use_bridge_grid=bool(args.bridge_tile),
+        emission_backend=getattr(args, "emission_backend", "legacy"),
+        stpuppeteer_config=getattr(args, "stpuppeteer_config", None),
     )
 
     scene = res.scene
@@ -494,6 +509,8 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
             num_workers=args.num_workers,
             model_path=str(args.model),
             device=args.device,
+            emission_backend=getattr(args, "emission_backend", "legacy"),
+            stpuppeteer_config=getattr(args, "stpuppeteer_config", None),
         )
 
     if args.stamp_transcripts and model.transcripts_priors is not None:
@@ -862,6 +879,18 @@ def build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--stamp-transcripts", action="store_true",
                        help="stamp each cell's provenance with cellAdmix-implied "
                             "type + uncertainty (requires fit-model --with-transcripts)")
+    exp.add_argument("--emission-backend", dest="emission_backend",
+                       choices=["legacy", "stpuppeteer"], default="legacy",
+                       help="molecular-emission backend. 'legacy' (default): "
+                            "cellAdmix-fit NMF priors + LogNormal-Poisson counts "
+                            "+ compartment-aware placement. 'stpuppeteer': "
+                            "STpuppeteer LMC counts + per-cell-independent halo "
+                            "leakage, configured via --stpuppeteer-config. "
+                            "Phase 0: stpuppeteer raises NotImplementedError.")
+    exp.add_argument("--stpuppeteer-config", dest="stpuppeteer_config",
+                       default=None,
+                       help="path to STpuppeteer YAML config (required when "
+                            "--emission-backend=stpuppeteer)")
     exp.add_argument("--annotation", default=None,
                        help="cell-type annotation CSV (overrides model's)")
 
