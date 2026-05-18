@@ -468,23 +468,28 @@ def _choose_stratified_cells(
     # spread the quota geographically.
     chosen: list[CellSummary] = []
     rng = np.random.default_rng(seed)
+    # Precompute per-cell xy + cluster membership indices to avoid O(n_cells^2)
+    # cost from list.index() calls inside the per-cluster loop. With ~140k cells
+    # × 20 clusters of ~7k members each, the old per-member list.index() was
+    # ~20 billion Python ops (would run ~5h on a real bundle).
+    all_xys = np.array([[c.x, c.y] for c in cell_list], dtype=np.float64)
     for ci in range(k_eff):
         if quota[ci] <= 0:
             continue
-        members = [cell_list[i] for i in range(len(cell_list))
-                     if labels[i] == ci]
-        if not members:
+        member_idx = np.where(labels == ci)[0]
+        if member_idx.size == 0:
             continue
-        if quota[ci] >= len(members):
-            chosen.extend(members)
+        if quota[ci] >= member_idx.size:
+            chosen.extend(cell_list[i] for i in member_idx)
             continue
         # FPS — start at the cluster-centroid-nearest cell (k-medoid-ish)
         centroid = km.cluster_centers_[ci]
-        dists_to_centroid = np.linalg.norm(
-            comp[[cell_list.index(m) for m in members]] - centroid, axis=1)
+        member_comp = comp[member_idx]
+        dists_to_centroid = np.linalg.norm(member_comp - centroid, axis=1)
         seed_idx = int(np.argmin(dists_to_centroid))
+        members = [cell_list[i] for i in member_idx]
         picked = [members[seed_idx]]
-        xys = np.array([[m.x, m.y] for m in members], dtype=np.float64)
+        xys = all_xys[member_idx]
         seed_xy = xys[seed_idx]
         min_d = np.linalg.norm(xys - seed_xy, axis=1)
         for _ in range(int(quota[ci]) - 1):
