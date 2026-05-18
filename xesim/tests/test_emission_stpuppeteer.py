@@ -245,6 +245,264 @@ def test_classify_leakage_helper():
     assert abs(rate_B - 0.30) < 0.02, f"B rate {rate_B:.3f} ≉ 0.30"
 
 
+# ---------------------------------------------------------------------------
+# 2.5D (emit_3d) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_scene_3d():
+    """A tiny (5 z-planes, 50x50 px) scene with two CellRecord cells.
+
+    Cells span z-planes 1..3 (so a 3-slice z-extent each); they're adjacent
+    in xy so neighbour-interior halo landings should occur.
+    """
+    n_z, H, W = 5, 50, 50
+    cell_label_3d = np.zeros((n_z, H, W), dtype=np.int32)
+    nucleus_label_3d = np.zeros((n_z, H, W), dtype=np.int32)
+    # Cell 1: z=1..3, y=10..30, x=10..25
+    cell_label_3d[1:4, 10:30, 10:25] = 1
+    nucleus_label_3d[2, 16:24, 14:21] = 1
+    # Cell 2: z=1..3, y=10..30, x=27..42 (adjacent to cell 1)
+    cell_label_3d[1:4, 10:30, 27:42] = 2
+    nucleus_label_3d[2, 16:24, 31:38] = 2
+
+    # Build CellRecord-like records — emit_3d only reads cell_idx,
+    # cell_id, cell_type, so we don't need the full 3D fields.
+    cells_records = [
+        SimpleNamespace(cell_idx=1, cell_id="c1", cell_type="Epithelial",
+                          provenance={"is_ghost": False}),
+        SimpleNamespace(cell_idx=2, cell_id="c2", cell_type="Epithelial",
+                          provenance={"is_ghost": False}),
+    ]
+    psz = 0.5
+    z_step = 3.0
+    z_slices_um = [i * z_step for i in range(n_z)]
+    return SimpleNamespace(
+        cells_records=cells_records,
+        cell_label_3d=cell_label_3d,
+        nucleus_label_3d=nucleus_label_3d,
+        z_slices_um=z_slices_um,
+        pixel_size_um=psz,
+        z_step_um=z_step,
+    )
+
+
+def test_emit_3d_smoke(synthetic_scene_3d, synthetic_config_path):
+    """End-to-end smoke: emit_3d produces a DataFrame with the 2.5D schema."""
+    from xesim.emission_stpuppeteer import emit_3d
+    s = synthetic_scene_3d
+    df = emit_3d(
+        cells_records=s.cells_records,
+        cell_label_3d=s.cell_label_3d,
+        nucleus_label_3d=s.nucleus_label_3d,
+        z_slices_um=s.z_slices_um,
+        tile_origin_um=(0.0, 0.0),
+        pixel_size_um=s.pixel_size_um,
+        stpuppeteer_config=synthetic_config_path,
+        rng=np.random.default_rng(3),
+    )
+    # The 2.5D writer reads these columns; emit_3d must produce them.
+    required = {"x_true", "y_true", "z_true", "true_cell_idx",
+                "true_cell_id", "true_cell_type", "source", "gene",
+                "factor_label", "qv", "is_ghost"}
+    assert required.issubset(set(df.columns))
+    assert len(df) > 0
+    # Source always "body" in v1 (no ambient background; ghosts off).
+    assert (df["source"] == "body").all()
+    assert (df["is_ghost"] == False).all()
+    # true_cell_idx ↔ cell labels we configured.
+    assert set(df["true_cell_idx"].unique()) <= {1, 2}
+
+
+def test_emit_3d_z_within_stack(synthetic_scene_3d, synthetic_config_path):
+    """All emitted z coordinates fall within the configured z-stack range."""
+    from xesim.emission_stpuppeteer import emit_3d
+    s = synthetic_scene_3d
+    df = emit_3d(
+        cells_records=s.cells_records,
+        cell_label_3d=s.cell_label_3d,
+        nucleus_label_3d=s.nucleus_label_3d,
+        z_slices_um=s.z_slices_um,
+        tile_origin_um=(0.0, 0.0),
+        pixel_size_um=s.pixel_size_um,
+        stpuppeteer_config=synthetic_config_path,
+        rng=np.random.default_rng(8),
+    )
+    # Voxel centers + ±half-z-step jitter → all coords in
+    # [z_min - z_step/2, z_max + z_step/2].
+    z_min = float(min(s.z_slices_um)) - 0.5 * s.z_step_um
+    z_max = float(max(s.z_slices_um)) + 0.5 * s.z_step_um
+    assert df["z_true"].min() >= z_min - 1e-6
+    assert df["z_true"].max() <= z_max + 1e-6
+
+
+def test_emit_3d_anisotropic_z(synthetic_config_path):
+    """Anisotropic EDT: a 1-z-step jump is "expensive" relative to a 1-xy-pixel jump.
+
+    We build a single-z-slice cell so the cell occupies ONLY slice 2 in z.
+    Any leaked transcript at slice 1 or 3 had to "jump" exactly one z-step
+    (3 µm). Any leaked transcript still at slice 2 had to "jump" in xy
+    only. With λ ≈ 1.4 µm and z_step (3 µm) ≫ psz (0.5 µm), the xy halo
+    should dominate by an order of magnitude. If the EDT's anisotropic
+    sampling tuple is wrong (e.g., reversed or unit), z-shifted
+    transcripts would be roughly comparable to xy-only.
+    """
+    from xesim.emission_stpuppeteer import emit_3d
+    n_z, H, W = 5, 50, 50
+    cell_label_3d = np.zeros((n_z, H, W), dtype=np.int32)
+    nucleus_label_3d = np.zeros((n_z, H, W), dtype=np.int32)
+    # Cell exists ONLY at slice 2 (one z-slice deep).
+    cell_label_3d[2, 18:32, 18:32] = 1
+    nucleus_label_3d[2, 22:28, 22:28] = 1
+    cells_records = [
+        SimpleNamespace(cell_idx=1, cell_id="c1", cell_type="Epithelial",
+                          provenance={"is_ghost": False}),
+    ]
+    psz, z_step = 0.5, 3.0
+    z_slices_um = [i * z_step for i in range(n_z)]
+
+    # Aggregate over 10 seeds — single cell, so per-seed leak counts are small.
+    n_at_source_slice = 0
+    n_at_neighbour_z = 0
+    for seed in range(10):
+        df = emit_3d(
+            cells_records=cells_records,
+            cell_label_3d=cell_label_3d,
+            nucleus_label_3d=nucleus_label_3d,
+            z_slices_um=z_slices_um,
+            tile_origin_um=(0.0, 0.0),
+            pixel_size_um=psz,
+            stpuppeteer_config=synthetic_config_path,
+            rng=np.random.default_rng(seed),
+        )
+        leaked = df[df["is_leaked"]]
+        if len(leaked) == 0:
+            continue
+        # Source cell at z=6.0. With ±half-z-step jitter, transcripts
+        # ON slice 2 have z in [4.5, 7.5]; on slice 1 or 3 they have z in
+        # [1.5, 4.5] or [7.5, 10.5].
+        dz = np.abs(leaked["z_true"].to_numpy() - 6.0)
+        n_at_source_slice += int((dz < 1.5 - 1e-6).sum())
+        n_at_neighbour_z += int((dz >= 1.5 - 1e-6).sum())
+
+    # With λ ≈ 1.4 µm, exp(-3/1.4) ≈ 0.12 (z neighbour weight) vs
+    # exp(-0.5/1.4) ≈ 0.70 (xy 1-pixel weight). Even accounting for the
+    # larger neighbour-slice voxel count, xy should clearly dominate.
+    assert n_at_source_slice > n_at_neighbour_z, (
+        f"anisotropic-EDT check failed: source-slice n={n_at_source_slice} "
+        f"vs neighbour-z n={n_at_neighbour_z}. Expected source-slice to dominate "
+        f"(z_step=3µm makes z-jumps ~6× more 'expensive' than xy-pixel jumps)."
+    )
+
+
+def test_emit_3d_reproducible(synthetic_scene_3d, synthetic_config_path):
+    """Same RNG seed → byte-identical output."""
+    from xesim.emission_stpuppeteer import emit_3d
+    s = synthetic_scene_3d
+
+    def _run(seed):
+        return emit_3d(
+            cells_records=s.cells_records,
+            cell_label_3d=s.cell_label_3d,
+            nucleus_label_3d=s.nucleus_label_3d,
+            z_slices_um=s.z_slices_um,
+            tile_origin_um=(0.0, 0.0),
+            pixel_size_um=s.pixel_size_um,
+            stpuppeteer_config=synthetic_config_path,
+            rng=np.random.default_rng(seed),
+        )
+    pd.testing.assert_frame_equal(_run(11), _run(11))
+
+
+def test_per_celltype_marker_specificity(synthetic_config_path):
+    """The dominant genes in each cell type's transcripts are its own markers.
+
+    The synthetic config has three exclusive programs:
+        Epithelial → ProgEpi   (KRT8, KRT18, EPCAM)  + ProgHK (shared)
+        Immune     → ProgImm   (PTPRC, CD3D)         + ProgHK (shared)
+    Marker specificity check: a transcript emitted by an Epithelial cell
+    should be a ProgEpi or ProgHK gene; an Immune cell's transcripts
+    should be ProgImm or ProgHK. Cross-type marker hits only occur when
+    a leaked transcript lands in a neighbour cell — those should be the
+    minority (≲ 10% with leakage=0.20 / 0.05 in the synthetic config).
+
+    This is the formal regression test for the per-celltype-marker spot
+    check we ran on the pancreas region. If a future change accidentally
+    couples gene-program activations or breaks the source-cell tag on
+    leaked transcripts, this test catches it.
+    """
+    from xesim.emission_stpuppeteer import emit_2d
+    epi_markers = {"KRT8", "KRT18", "EPCAM"}
+    imm_markers = {"PTPRC", "CD3D"}
+    hk_markers = {"ACTB", "GAPDH"}
+
+    # Build a small scene with one of each type, well separated so
+    # cross-cell leakage stays small (so the specificity signal is clean).
+    H, W = 60, 60
+    cell_label = np.zeros((H, W), dtype=np.int32)
+    nucleus_label = np.zeros((H, W), dtype=np.int32)
+    cell_label[8:22, 8:22] = 1   # Epithelial
+    nucleus_label[12:18, 12:18] = 1
+    cell_label[38:52, 38:52] = 2  # Immune (far from cell_1)
+    nucleus_label[42:48, 42:48] = 2
+    cells = [
+        SimpleNamespace(cell_id="c_epi", label=1, cell_type="Epithelial",
+                          provenance={"is_ghost": False}),
+        SimpleNamespace(cell_id="c_imm", label=2, cell_type="Immune",
+                          provenance={"is_ghost": False}),
+    ]
+    scene = SimpleNamespace(cell_label=cell_label, nucleus_label=nucleus_label,
+                              cells=cells, pixel_size=0.5)
+
+    # Aggregate over many seeds so the rates are stable.
+    rows = []
+    for seed in range(20):
+        df = emit_2d(scene=scene, stpuppeteer_config=synthetic_config_path,
+                     rng=np.random.default_rng(seed), pixel_size_um=0.5)
+        if len(df) > 0:
+            rows.append(df.assign(_seed=seed))
+    df = pd.concat(rows, ignore_index=True)
+
+    # For Epithelial cells, share of OWN markers (ProgEpi ∪ ProgHK).
+    epi = df[df["source_cell_type"] == "Epithelial"]
+    epi_own = epi["gene"].isin(epi_markers | hk_markers).mean()
+    assert epi_own > 0.95, (
+        f"Epithelial own-marker fraction {epi_own:.1%} too low; expected ≥95%. "
+        "STpuppeteer's program-based emission shouldn't produce immune-marker "
+        "transcripts from epithelial cells (the activation matrix is exclusive)."
+    )
+
+    # Same for Immune cells.
+    imm = df[df["source_cell_type"] == "Immune"]
+    imm_own = imm["gene"].isin(imm_markers | hk_markers).mean()
+    assert imm_own > 0.95, (
+        f"Immune own-marker fraction {imm_own:.1%} too low; expected ≥95%."
+    )
+
+    # Cross-check: an epithelial cell should rarely emit immune markers and
+    # vice versa (only via leakage spillover, and the cells are placed far
+    # apart so even leakage shouldn't cross-contaminate).
+    assert epi["gene"].isin(imm_markers).mean() < 0.05
+    assert imm["gene"].isin(epi_markers).mean() < 0.05
+
+
+def test_cell_label_value_helper():
+    """The adapter helper picks up either .label (2D) or .cell_idx (2.5D)."""
+    from xesim.emission_stpuppeteer.cell_adapter import _cell_label_value
+
+    class HasLabel:
+        label = 7
+
+    class HasCellIdx:
+        cell_idx = 12
+
+    assert _cell_label_value(HasLabel()) == 7
+    assert _cell_label_value(HasCellIdx()) == 12
+    with pytest.raises(AttributeError):
+        _cell_label_value(SimpleNamespace())
+
+
 def test_simulationconfig_from_dict_round_trip():
     """SimulationConfig.from_dict accepts both explicit and shorthand styles."""
     from STpuppeteer.simulation import SimulationConfig

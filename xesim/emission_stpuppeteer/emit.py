@@ -135,12 +135,162 @@ def emit_2d(
     return _to_xesim_schema_2d(placed, cell_gdf, scene)
 
 
-def emit_3d(*args, **kwargs) -> pd.DataFrame:
-    """2.5D STpuppeteer emission. Phase 2 — not implemented yet."""
-    raise NotImplementedError(
-        "2.5D STpuppeteer emission is not yet implemented (Phase 2). "
-        "See tmp/cellAdmix-integration.md §9 for the plan."
+def emit_3d(
+    cells_records,
+    cell_label_3d: np.ndarray,
+    nucleus_label_3d: np.ndarray,
+    *,
+    z_slices_um,
+    tile_origin_um: tuple[float, float],
+    pixel_size_um: float,
+    stpuppeteer_config: str,
+    rng: np.random.Generator,
+    **_extra,
+) -> pd.DataFrame:
+    """2.5D STpuppeteer emission.
+
+    Parallel to ``emit_2d``: load config → build cell table → sample
+    counts + leakage → place via per-cell SDF. Differences from 2D:
+
+    - **Input shape**: ``cell_label_3d`` / ``nucleus_label_3d`` are 3D
+      ``(n_z, H, W)`` arrays. ``cells_records`` is a list of
+      ``CellRecord`` (2.5D's cell dataclass) — adapter handles the
+      ``.cell_idx`` vs ``.label`` field-name difference.
+    - **Output schema**: matches the legacy
+      ``emit_molecules_3d_from_priors`` columns
+      (``x_true, y_true, z_true, true_cell_idx, true_cell_id,
+      true_cell_type, source, gene, factor_label, qv, is_ghost``) so the
+      2.5D bundle writer reads from it unchanged.
+
+    Empty result if the scene has no cells or no configurable cell types.
+    """
+    if stpuppeteer_config is None:
+        raise ValueError(
+            "emit_3d requires --stpuppeteer-config PATH; got None. "
+            "This should have been caught at CLI validation time."
+        )
+
+    from .config_loader import load_stpuppeteer_config
+    from .cell_adapter import build_stpuppeteer_cell_gdf, _cell_label_value
+    from .counts import emit_decisions
+    from .placement_3d import place_3d
+
+    cfg = load_stpuppeteer_config(stpuppeteer_config)
+
+    # Step 1: build cell table. Same adapter as 2D — it consumes the 3D
+    # cell_label via np.bincount on the flattened array (dimension-agnostic).
+    cell_gdf = build_stpuppeteer_cell_gdf(cells_records, cell_label_3d, cfg)
+    if len(cell_gdf) == 0:
+        return _empty_3d_output()
+
+    # Step 2: count + leakage decisions (geometry-free).
+    trs_df = emit_decisions(cell_gdf, cfg, rng)
+    if len(trs_df) == 0:
+        return _empty_3d_output()
+
+    # Step 3: thread cell_id ↔ integer label, plus pre-compute the
+    # cell_idx and cell_type lookups we'll need for the output schema.
+    cell_id_to_label = {c.cell_id: _cell_label_value(c) for c in cells_records}
+    cell_id_to_type = {c.cell_id: (c.cell_type or "") for c in cells_records}
+    trs_df["_label"] = trs_df["cell_id"].map(cell_id_to_label).astype("int64")
+
+    # Step 4: per-cell λ / max_dist from cell-VISIBLE volumes. For 2.5D
+    # we use the same area-based formula as 2D for simplicity (§6.4 of
+    # the design doc): r_eff = sqrt(visible_area_um² / π). The
+    # "visible area" used here is voxel_count × psz² (so it's actually
+    # volume-divided-by-psz, not 2D footprint area). This makes r_eff
+    # proportionally larger for thicker cells — a defensible
+    # approximation; revisit if calibration evidence prefers a true
+    # 2D-projection footprint or a volume-derived r_eff.
+    psz2 = pixel_size_um * pixel_size_um
+    cell_area_um2 = cell_gdf["visible_voxels"].to_numpy(dtype=np.float64) * psz2
+    r_eff = np.sqrt(cell_area_um2 / np.pi)
+    max_dist_arr = float(cfg.leak_dist_factor) * r_eff
+    coverage = _DEFAULT_COVERAGE
+    lam_arr = np.where(
+        max_dist_arr > 0.0,
+        max_dist_arr / (-np.log(1.0 - coverage)),
+        0.0,
     )
+    label_arr = cell_gdf["cell_id"].map(cell_id_to_label).to_numpy(dtype=np.int64)
+    leak_lam = dict(zip(label_arr.tolist(), lam_arr.tolist()))
+    max_dist = dict(zip(label_arr.tolist(), max_dist_arr.tolist()))
+
+    # Step 5: place transcripts in 3D.
+    placed = place_3d(
+        trs_df=trs_df,
+        cell_label_3d=cell_label_3d,
+        nucleus_label_3d=nucleus_label_3d,
+        psz_um=pixel_size_um,
+        z_slices_um=z_slices_um,
+        tile_origin_um=tile_origin_um,
+        leak_lam_per_cell=leak_lam,
+        max_dist_per_cell=max_dist,
+        rng=rng,
+    )
+
+    # Step 6: schema mapping for the 2.5D bundle writer.
+    return _to_xesim_schema_3d(placed, cell_gdf, cell_id_to_type, cell_id_to_label)
+
+
+def _to_xesim_schema_3d(
+    placed: pd.DataFrame,
+    cell_gdf: pd.DataFrame,
+    cell_id_to_type: dict,
+    cell_id_to_label: dict,
+) -> pd.DataFrame:
+    """Map placed transcripts to the 2.5D writer's expected columns.
+
+    Output column order matches ``emit_molecules_3d_from_priors._OUT_COLS``
+    so ``bundle_writer_25d`` reads from it unchanged.
+    """
+    n = len(placed)
+    # source: STpuppeteer emits "body" transcripts only (no ghost source
+    # in v1, no ambient background). is_ghost is False for the same reason.
+    # If/when ghost integration lands (Phase 6) this will need updating.
+    return pd.DataFrame({
+        "x_true": placed["x_location"].astype(np.float32).values,
+        "y_true": placed["y_location"].astype(np.float32).values,
+        "z_true": placed["z_location"].astype(np.float32).values,
+        "true_cell_idx": placed["cell_id"].map(cell_id_to_label)
+                                              .astype(np.int64).values,
+        "true_cell_id": placed["cell_id"].astype(object).values,
+        "true_cell_type": placed["cell_id"].map(cell_id_to_type)
+                                              .fillna("").astype(object).values,
+        "source": np.full(n, "body", dtype=object),
+        "gene": placed["feature_name"].astype(object).values,
+        "factor_label": np.full(n, -1, dtype=np.int64),
+        "qv": np.full(n, _DEFAULT_QV, dtype=np.float32),
+        "is_ghost": np.zeros(n, dtype=bool),
+        # STpuppeteer provenance columns alongside the legacy schema.
+        # The bundle writer's transcripts.parquet will drop these; the
+        # ground-truth provenance file may keep them when wired in.
+        "is_leaked": placed["is_leaked"].astype(bool).values,
+        "compartment": placed["compartment"].astype(object).values,
+        "landed_in_cell_id": placed["landed_in_cell_id"].astype(object).values,
+        "overlaps_nucleus": placed["overlaps_nucleus"].astype(np.uint8).values,
+    })
+
+
+def _empty_3d_output() -> pd.DataFrame:
+    """Empty DataFrame with the 2.5D output schema."""
+    return pd.DataFrame({
+        "x_true": pd.array([], dtype="float32"),
+        "y_true": pd.array([], dtype="float32"),
+        "z_true": pd.array([], dtype="float32"),
+        "true_cell_idx": pd.array([], dtype="int64"),
+        "true_cell_id": pd.array([], dtype="object"),
+        "true_cell_type": pd.array([], dtype="object"),
+        "source": pd.array([], dtype="object"),
+        "gene": pd.array([], dtype="object"),
+        "factor_label": pd.array([], dtype="int64"),
+        "qv": pd.array([], dtype="float32"),
+        "is_ghost": pd.array([], dtype="bool"),
+        "is_leaked": pd.array([], dtype="bool"),
+        "compartment": pd.array([], dtype="object"),
+        "landed_in_cell_id": pd.array([], dtype="object"),
+        "overlaps_nucleus": pd.array([], dtype="uint8"),
+    })
 
 
 def _scene_tile_origin(scene) -> tuple[float, float]:

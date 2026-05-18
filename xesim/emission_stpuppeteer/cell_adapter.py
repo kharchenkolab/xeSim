@@ -31,6 +31,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _cell_label_value(cell) -> int:
+    """Read the integer key used to index cell_label / cell_label_3d.
+
+    xeSim has two cell dataclasses that mean the same thing but spell
+    the field differently:
+
+    - ``MechanisticCell.label`` (2D pipeline, ``scene_2d``)
+    - ``CellRecord.cell_idx``  (2.5D pipeline, ``scene_2_5d/sdf_tess``)
+
+    Both are the integer that ``cell_label[...]`` / ``cell_label_3d[...]``
+    voxels are populated with (1-indexed; 0 = background). Rather than
+    rename across the codebase, we centralise the lookup here.
+    """
+    val = getattr(cell, "label", None)
+    if val is None:
+        val = getattr(cell, "cell_idx", None)
+    if val is None:
+        raise AttributeError(
+            f"cell {cell!r} has neither .label nor .cell_idx; "
+            "cannot determine its cell_label index."
+        )
+    return int(val)
+
+
 def build_stpuppeteer_cell_gdf(
     scene_cells: Iterable,
     cell_label: np.ndarray,
@@ -106,7 +130,8 @@ def build_stpuppeteer_cell_gdf(
     n_substituted = 0
     substituted_types: dict[str, int] = {}
     for c in cells:
-        label = int(c.label)
+        # Works for both MechanisticCell.label (2D) and CellRecord.cell_idx (2.5D).
+        label = _cell_label_value(c)
         if label <= 0 or label > max_label:
             continue
         n_vox = int(voxel_count_by_label[label])
