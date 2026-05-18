@@ -435,12 +435,21 @@ def build_scene(
         sb = (xmin_raw, ymin_raw, xmax_raw, ymax_raw)
     else:
         sb = tuple(scene_bounds_um)
-    grid = tile_grid(sb, tile_size_um, overlap_um=overlap_um)
+    # Snap tile spacing to an exact multiple of pixel_size so that the
+    # tile-grid µm coords align with the stitched-buffer pixel grid. Without
+    # this snap, the grid uses spacing_um = tile_size_um - overlap_um but the
+    # stitcher pastes at i * round(spacing_um / pixel_size) pixels, drifting
+    # tile_i by (step_px*psz - spacing_um) µm — at default 6 µm overlap on
+    # 0.2125 µm/px, that's +0.05 µm/tile, ~3.5 µm across a 35k-px bundle —
+    # visible as cell-polygon misalignment in saved morphology.
+    spacing_um_raw = tile_size_um - overlap_um
+    step_px = int(round(spacing_um_raw / pixel_size))
+    spacing_um = step_px * pixel_size                # snap to pixel grid
+    overlap_um_snapped = tile_size_um - spacing_um
+    grid = tile_grid(sb, tile_size_um, overlap_um=overlap_um_snapped)
 
     nx = max(c.grid_i for c in grid) + 1
     ny = max(c.grid_j for c in grid) + 1
-    spacing_um = tile_size_um - overlap_um
-    step_px = int(round(spacing_um / pixel_size))
     overlap_px = tile_px - step_px
     H_total = (ny - 1) * step_px + tile_px
     W_total = (nx - 1) * step_px + tile_px
