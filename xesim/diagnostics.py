@@ -524,6 +524,31 @@ TYPE_PALETTE = {
 TYPE_DEFAULT_COLOR = "#cccccc"
 
 
+def _find_annotation(bundle_path: Path, model_dir: Path):
+    """Locate the real-bundle cell-type annotation CSV.
+
+    Tries the standard locations in order; returns the DataFrame
+    (cols ``cell_id`` + ``merged_annotation``) or None if not found."""
+    import pandas as pd
+    cands = [
+        bundle_path / "annotations" / "annotation.csv.gz",
+        bundle_path.parent / "annotations" / "annotation.csv.gz",
+        model_dir / "annotations" / "annotation.csv.gz",
+        bundle_path / "annotations" / "annotation.csv",
+        bundle_path.parent / "annotations" / "annotation.csv",
+        model_dir / "annotations" / "annotation.csv",
+    ]
+    for p in cands:
+        if p.exists():
+            try:
+                df = pd.read_csv(p)
+                if "cell_id" in df.columns and "merged_annotation" in df.columns:
+                    return df
+            except Exception:
+                continue
+    return None
+
+
 def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
                               model_dir: Path, out_dir: Path,
                               crop_um: float = 64.0,
@@ -538,6 +563,12 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
     that type. Each row shows real | rendered | rendered+contours+tx with
     cell contours colored per type and a per-type legend below.
 
+    Region selection is anchored to the REAL bundle's cells + annotation
+    (NOT the synth bundle's cells_synth.parquet) so that the SAME real
+    bundle always yields the SAME region picks, regardless of which model
+    rendered the synth_dir. This makes density-vs-stratified diagnostic
+    comparisons apples-to-apples.
+
     Replaces the older per-type 3-cell-per-row 2-column layout.
     The ``cells_per_type`` argument is accepted for API compatibility
     and ignored.
@@ -548,14 +579,23 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
     import matplotlib.pyplot as plt
 
     out = Path(out_dir) / "scale_A4_cell_grid.png"
-    gt_path = synth_dir / "ground_truth" / "cells_synth.parquet"
-    if not gt_path.exists():
+
+    # Anchor picks to the REAL bundle (deterministic across synth bundles)
+    real_cells_path = bundle_path / "cells.parquet"
+    if not real_cells_path.exists():
         return out
-    gt = pd.read_parquet(gt_path)
-    if "cell_type" not in gt.columns:
+    real_cells = pd.read_parquet(
+        real_cells_path, columns=["cell_id", "x_centroid", "y_centroid"])
+    ann_df = _find_annotation(bundle_path, model_dir)
+    if ann_df is None:
         return out
+    cell_to_type = dict(zip(ann_df["cell_id"].astype(str),
+                              ann_df["merged_annotation"].astype(str)))
+    real_cells["cell_type"] = real_cells["cell_id"].astype(str).map(cell_to_type)
+    gt = real_cells.dropna(subset=["cell_type"]).rename(
+        columns={"x_centroid": "centroid_x", "y_centroid": "centroid_y"})
     types_used = [t for t in sorted(gt["cell_type"].dropna().unique())
-                    if t.lower() != "unknown"]
+                    if t.lower() != "unknown" and t.lower() != "ambiguous / low-quality"]
     if not types_used:
         return out
 
