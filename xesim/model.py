@@ -252,6 +252,7 @@ class XesimModel:
         celladmix_run: str | Path | None = None,
         crop_selection: str = "density",
         stratified_alpha: float = 0.5,
+        stratified_within_pick: str = "centroid",
     ) -> "XesimModel":
         """Fit a complete model from a Xenium bundle and produce a
         self-contained MODEL_DIR. Long-running (~30-60 min).
@@ -273,6 +274,7 @@ class XesimModel:
             crop_selection=crop_selection,
             annotation_path=annotations_path,
             stratified_alpha=stratified_alpha,
+            stratified_within_pick=stratified_within_pick,
         )
         # 2) attach annotations
         print(f"[fit] attach cell types from {annotations_path}")

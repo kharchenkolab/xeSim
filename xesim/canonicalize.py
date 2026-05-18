@@ -73,6 +73,7 @@ def canonicalize_bundle(
     cell_id_col: str = "cell_id",
     stratified_alpha: float = 0.5,
     stratified_k: int = 20,
+    stratified_within_pick: str = "centroid",
 ) -> Path:
     """Create canonical crop npz files and a manifest from one Xenium bundle.
 
@@ -130,6 +131,7 @@ def canonicalize_bundle(
             seed=seed,
             stratified_k=stratified_k,
             stratified_alpha=stratified_alpha,
+            stratified_within_pick=stratified_within_pick,
         )
         crop_selection_mode = crop_selection
     split_by_crop = assign_spatial_splits(

@@ -89,6 +89,7 @@ def _fit_model(args: argparse.Namespace) -> None:
         celladmix_run=getattr(args, "celladmix_run", None),
         crop_selection=args.crop_selection,
         stratified_alpha=args.stratified_alpha,
+        stratified_within_pick=args.stratified_within_pick,
     )
     # Diagnostics (opt-in via --diagnostic flag).
     if getattr(args, "diagnostic", None) is not None:
@@ -764,6 +765,13 @@ def build_parser() -> argparse.ArgumentParser:
                        "1.0=proportional (≈spread), 0.0=uniform-per-cluster, "
                        "0.5=moderate rare-upsampling (matches WSI foundation-"
                        "model standard practice).")
+    fit.add_argument("--stratified-within-pick", default="centroid",
+                       choices=["centroid", "density"],
+                       help="within-cluster pick rule for stratified selection. "
+                       "centroid (default): cluster's compositional medoid (k-medoid-"
+                       "ish). density: cell with highest local density in the "
+                       "cluster, then density × spatial-FPS — gives the renderer "
+                       "info-rich crops while preserving compositional coverage.")
     fit.add_argument("--steps", type=int, default=8000,
                        help="renderer training steps")
     fit.add_argument("--seed", type=int, default=1)

@@ -244,6 +244,7 @@ def choose_crop_boxes(
     *,
     stratified_k: int = 20,
     stratified_alpha: float = 0.5,
+    stratified_within_pick: str = "centroid",
 ) -> list[CropBox]:
     """Select crop boxes centered on cells using a deterministic strategy.
 
@@ -289,7 +290,8 @@ def choose_crop_boxes(
     elif selection == "stratified":
         chosen = _choose_stratified_cells(
             valid, n, crop_size_um,
-            k=stratified_k, alpha=stratified_alpha, seed=seed)
+            k=stratified_k, alpha=stratified_alpha, seed=seed,
+            within_pick=stratified_within_pick)
     elif n >= len(valid):
         chosen = valid
     else:
@@ -389,6 +391,7 @@ def _choose_stratified_cells(
     k: int,
     alpha: float,
     seed: int,
+    within_pick: str = "centroid",
 ) -> list[CellSummary]:
     """Composition-aware crop selection.
 
@@ -465,14 +468,30 @@ def _choose_stratified_cells(
             quota[i] += 1
 
     # Within each cluster: spatial farthest-point sampling on (x, y) to
-    # spread the quota geographically.
+    # spread the quota geographically. The first pick (seed) is the most
+    # "representative" member of the cluster — interpretation depends on
+    # ``within_pick``:
+    #   - "centroid" (default): closest to the k-means centroid (= compositional
+    #     medoid; conservative / boring per-cluster exemplar)
+    #   - "density":  cell with the highest local cell density (= the most
+    #     INFORMATIVE crop within that compositional cluster). Aligns crop
+    #     selection with the renderer's appetite for cell-rich training windows.
     chosen: list[CellSummary] = []
     rng = np.random.default_rng(seed)
-    # Precompute per-cell xy + cluster membership indices to avoid O(n_cells^2)
-    # cost from list.index() calls inside the per-cluster loop. With ~140k cells
-    # × 20 clusters of ~7k members each, the old per-member list.index() was
-    # ~20 billion Python ops (would run ~5h on a real bundle).
     all_xys = np.array([[c.x, c.y] for c in cell_list], dtype=np.float64)
+
+    # Pre-compute per-cell local density (count in 3x3 bin neighborhood) when
+    # the picker needs it. Same convention as _choose_density_cells. Cheap.
+    density_per_cell = None
+    if within_pick == "density":
+        density_per_cell = np.array(
+            [sum(bins.get((cell_bin[c.cell_id][0] + dx,
+                              cell_bin[c.cell_id][1] + dy),
+                              np.zeros(n_types, dtype=np.int64)).sum()
+                  for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+             for c in cell_list],
+            dtype=np.int64)
+
     for ci in range(k_eff):
         if quota[ci] <= 0:
             continue
@@ -482,18 +501,29 @@ def _choose_stratified_cells(
         if quota[ci] >= member_idx.size:
             chosen.extend(cell_list[i] for i in member_idx)
             continue
-        # FPS — start at the cluster-centroid-nearest cell (k-medoid-ish)
-        centroid = km.cluster_centers_[ci]
-        member_comp = comp[member_idx]
-        dists_to_centroid = np.linalg.norm(member_comp - centroid, axis=1)
-        seed_idx = int(np.argmin(dists_to_centroid))
+        if within_pick == "density":
+            local_density = density_per_cell[member_idx]
+            seed_idx = int(np.argmax(local_density))
+        else:
+            centroid = km.cluster_centers_[ci]
+            member_comp = comp[member_idx]
+            dists_to_centroid = np.linalg.norm(member_comp - centroid, axis=1)
+            seed_idx = int(np.argmin(dists_to_centroid))
         members = [cell_list[i] for i in member_idx]
         picked = [members[seed_idx]]
         xys = all_xys[member_idx]
         seed_xy = xys[seed_idx]
         min_d = np.linalg.norm(xys - seed_xy, axis=1)
         for _ in range(int(quota[ci]) - 1):
-            idx = int(np.argmax(min_d))
+            if within_pick == "density":
+                # Maximize density × min_distance — combines info-rich picks
+                # with spatial spread. Avoids stacking the per-cluster quota on
+                # one density hotspot.
+                local_density = density_per_cell[member_idx]
+                score = local_density.astype(np.float64) * min_d
+                idx = int(np.argmax(score))
+            else:
+                idx = int(np.argmax(min_d))
             picked.append(members[idx])
             d = np.linalg.norm(xys - xys[idx], axis=1)
             min_d = np.minimum(min_d, d)
