@@ -141,14 +141,24 @@ def build_scene_25d(
     n_z = len(z_slices)
     n_ch = int(model.manifest.get("n_channels", 3))
 
-    # Build tile grid (with overlap)
+    # Snap tile_um and step to exact pixel multiples so the renderer (which
+    # rasterizes at floor(xmin/psz)*psz) and the stitcher (which pastes at
+    # round((tx0-xmin)/psz)) agree on tile boundaries. Without this snap,
+    # default tile_um=500 / overlap_um=50 / psz=0.2125 gives non-integer
+    # tile/step pixel sizes — accumulating 1 px per tile of rendered-content
+    # shift in the saved morphology.
+    _tile_px = int(round(tile_um / psz))
+    _overlap_px = int(round(overlap_um / psz))
+    tile_um = _tile_px * psz
+    overlap_um = _overlap_px * psz
     step = tile_um - overlap_um
     xs = list(np.arange(xmin, xmax, step))
     ys = list(np.arange(ymin, ymax, step))
     grid = [(x, y) for y in ys for x in xs]
     if progress:
         print(f"[build_scene_25d] bounds {xmin:.0f}-{xmax:.0f}, {ymin:.0f}-{ymax:.0f} µm "
-              f"-> {len(grid)} tiles ({tile_um}µm, overlap {overlap_um}µm)")
+              f"-> {len(grid)} tiles ({tile_um:.4f}µm = {_tile_px}px, "
+              f"overlap {overlap_um:.4f}µm = {_overlap_px}px)")
         print(f"  full output: ({n_z}, {H_full}, {W_full})")
 
     # Memory-mapped DAPI accumulator (float32 for feather-blend accumulation;
