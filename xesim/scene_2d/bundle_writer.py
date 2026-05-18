@@ -582,13 +582,24 @@ def _write_pyramid_ome_tiff(
                        for lvl in levels)
     use_bigtiff = bytes_total > 3 * (1 << 30)
     n_sub = max(0, len(levels) - 1)
+    import time as _time
+    _t0 = _time.time()
+    tag = out_path.name
+    print(f"  [pyramid] {tag}: writing {len(levels)} levels "
+          f"({levels[0].shape} → {levels[-1].shape}, "
+          f"{bytes_total/(1<<30):.2f} GiB "
+          f"{'bigtiff' if use_bigtiff else 'classic-tiff'})", flush=True)
     with tifffile.TiffWriter(out_path, ome=True, bigtiff=use_bigtiff) as tw:
         # Base resolution: declares the sub-IFD slots, gets OME metadata
         tw.write(levels[0], photometric="minisblack",
                  metadata=metadata, subifds=n_sub)
+        print(f"  [pyramid] {tag}: level 0/{len(levels)-1} done "
+              f"(elapsed {_time.time()-_t0:.1f}s)", flush=True)
         # Pyramid levels: each as a subfiletype=1 reduced-resolution sub-IFD
-        for sub in levels[1:]:
+        for li, sub in enumerate(levels[1:], start=1):
             tw.write(sub, photometric="minisblack", subfiletype=1)
+            print(f"  [pyramid] {tag}: level {li}/{len(levels)-1} done "
+                  f"(elapsed {_time.time()-_t0:.1f}s)", flush=True)
 
 
 def _make_xenium_morphology_ome_xml(
@@ -951,6 +962,10 @@ def write_bundle(
     if render_list:
         if len(render_list) == 1:
             img = render_list[0]
+            import time as _t
+            _s = _t.time()
+            print(f"[bundle_writer] morphology_focus: 4 channel files "
+                  f"(shape {img.shape})...", flush=True)
             _write_morphology_focus(
                 img, channel_names, pixel_size_um, out_dir,
                 target_stats=target_intensity_stats,
@@ -960,6 +975,9 @@ def write_bundle(
                 n_pyramid_levels=n_pyramid_levels,
                 display_lut=display_lut,
             )
+            print(f"[bundle_writer] morphology_focus done ({_t.time()-_s:.1f}s); "
+                  f"now morphology.ome.tif (Z-stack pyramid)...", flush=True)
+            _s = _t.time()
             _write_morphology_z(
                 img, channel_names, pixel_size_um,
                 out_dir / "morphology.ome.tif",
@@ -969,6 +987,8 @@ def write_bundle(
                 n_pyramid_levels=n_pyramid_levels,
                 display_lut=display_lut,
             )
+            print(f"[bundle_writer] morphology.ome.tif done ({_t.time()-_s:.1f}s)",
+                  flush=True)
             written["morphology"] = {
                 "focus": str(out_dir / "morphology_focus" /
                               "morphology_focus_0000.ome.tif"),
