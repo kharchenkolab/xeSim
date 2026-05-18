@@ -186,6 +186,40 @@ look/
 └── summary.json
 ```
 
+### 2.5D (z-stack) output
+
+Pass `--scene-mode 2.5d` to render a **multi-z DAPI stack** (12 planes
+by default, 3 µm step across 33 µm of depth) alongside the focal-plane
+4-channel morphology. Per-cell 3D tilt + extent are sampled from the
+fitted nucleus shape priors (`priors_3d/nucleus_priors.json`).
+
+```bash
+# Region (auto-stitches if area > 0.3 mm²)
+xesim explain PATH/TO/BUNDLE --model my_model/ --out region_25d/ \
+    --scene-mode 2.5d --region 1900,1400,2400,1900
+
+# Whole bundle — adds morphology.ome.tif z-stack to the standard bundle
+xesim explain PATH/TO/BUNDLE --model my_model/ --out full_25d/ \
+    --scene-mode 2.5d --whole-bundle --num-workers 3
+```
+
+2.5D outputs are standard Xenium-format bundles **plus** the extra
+DAPI z-stack in `morphology.ome.tif` and 3D per-molecule coordinates
+(`x_location`, `y_location`, `z_location`) in `transcripts.parquet`.
+Wall time for a typical pancreas-scale bundle is ~45–50 min at 3 GPU
+workers; multi-z DAPI dominates the runtime vs the 2D path.
+
+Stitch knobs (whole-bundle / large regions):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--stitch-tile-um` | 300 | per-tile size; smaller = more tiles, more I/O |
+| `--stitch-overlap-um` | 50 | tile overlap; feather-blended at seams |
+
+Per-cell focal-plane render comes from the same 2D `explain_region`
+path (so 2D and 2.5D match exactly at the focal plane); the 2.5D-novel
+contributions are the z-stack and 3D molecule coordinates.
+
 ## Python API
 
 The same tasks are available as Python entry points:
