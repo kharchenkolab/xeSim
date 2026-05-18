@@ -3,11 +3,7 @@
 
 **Procedural-mechanistic Xenium tissue simulator.**
 
-xeSim fits a generative model from a Xenium bundle and uses it to
-*explain* the bundle — re-rendering it through the model with full
-per-cell traceability of every pixel. Every output pixel is traceable
-to explicit per-cell biology — the renderer is bounded and cannot drift
-from the accounted-for cells.
+xeSim fits a hybrid physics-based model combined with a neural net renderer for Xenium bundles. The models parameters and scene configuration are optimized to best *explain* the experimentally-observed data: re-rendering the bundle should produce something that looks very similar to the original measurement, but every pixel and molecule in that data is traceable back to its virtual cell source. By constraining the staining and molecular data by the physical model, such simulations aim to provide realistic-looking data where the ground truth is actually known.
 
 <img src="docs/figures/cartoon.png" alt="drawing" width="600"/>
 
