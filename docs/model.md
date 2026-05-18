@@ -193,6 +193,18 @@ dense epithelium) are consistent with the current renderer's uniform
 per-channel reconstruction weight and are queued for a future training
 iteration that uses per-channel weighting.
 
+### Single-cell zoom
+
+Zooming in by an order of magnitude — 48 µm crops centered on
+individual cells, three picks per cell type:
+
+![real vs render — single-cell crops](figures/real_vs_render_cells.png)
+
+At this scale you can read off per-channel fidelity directly: nuclear
+DAPI shape and intensity, the membrane ring on epithelial cells, the
+sparse cytoplasm of immune cells. The same stain-balance gaps from the
+region panels are visible here cell by cell.
+
 ## Status
 
 - **2D:** production-ready, used as the default for whole-bundle output.
