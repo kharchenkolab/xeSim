@@ -324,13 +324,14 @@ def _explain_25d(args: argparse.Namespace) -> None:
         print(f"[explain-2.5d] tile scope: center ({x:.1f}, {y:.1f}) µm "
               f"(tile {tile_um}µm)")
     elif args.whole_bundle:
-        # Resolve the cell-vertex extent from the bundle
-        import pandas as pd
-        from pathlib import Path
-        cb = pd.read_parquet(Path(args.bundle) / "cell_boundaries.parquet")
-        bounds = (float(cb.vertex_x.min()), float(cb.vertex_y.min()),
-                  float(cb.vertex_x.max()), float(cb.vertex_y.max()))
-        print(f"[explain-2.5d] whole-bundle scope: "
+        # Match 2D convention: bundle pixel 0 = µm (0, 0). The morphology
+        # image's FOV is the canonical xmin/ymin; cell-extent bounds (which
+        # this used to compute via cell_boundaries.vertex_x.min) would put
+        # the saved bundle's pixel 0 at the cell-vertex-min absolute µm,
+        # breaking downstream readers (e.g. real_tile_image) that assume
+        # pixel 0 = µm 0.
+        bounds = _bundle_fov_bounds(args.bundle)
+        print(f"[explain-2.5d] whole-bundle scope (FOV): "
               f"({bounds[0]:.0f}, {bounds[1]:.0f}) — "
               f"({bounds[2]:.0f}, {bounds[3]:.0f}) µm")
         use_stitch = True
