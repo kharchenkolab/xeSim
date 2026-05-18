@@ -222,41 +222,48 @@ def _emit_molecules(
     backend (``transcripts.sample_scene_transcripts``) and the STpuppeteer
     backend (``emission_stpuppeteer.emit_2d``).
 
-    Returns DataFrame with `(x, y, gene, true_cell_id, is_ghost, true_factor, qv)`
-    plus a `source_cell_type` for tracking.
+    Both backends produce the same pre-rename schema (``cell_id``, ``gene``,
+    ``x``, ``y``, ``factor_label``, ``qv``, ``source_cell_type``). The xeSim
+    post-processing (rename ``cell_id`` → ``true_cell_id`` / ``factor_label``
+    → ``true_factor``, attach ``is_ghost`` from MechanisticCell provenance)
+    is applied here, AFTER the dispatch, so it works for both paths and the
+    downstream bundle writer reads a consistent schema.
     """
     if emission_backend == "stpuppeteer":
         from ..emission_stpuppeteer import emit_2d
-        return emit_2d(
+        df = emit_2d(
             scene=mech_scene,
             stpuppeteer_config=stpuppeteer_config,
             rng=rng,
         )
-
-    from ..transcripts import sample_scene_transcripts
-    import os as _os
-    # Per-cell tx-rate calibration. Precedence (highest first):
-    #   1. XESIM_TX_RATE_SCALE env var (debug override)
-    #   2. transcripts_priors["tx_rate_scale_default"] (baked-in per-
-    #      bundle calibration from fit-priors)
-    #   3. 1.0 (no scaling)
-    # Why: cellAdmix-fit per-type negbin means match real per-cell tx
-    # exactly, but per-tile sampling loses ~13-20% to visible_fraction
-    # scaling at tile boundaries. The default lets each bundle bake in
-    # its measured loss factor; explain stays single-knob from the CLI.
-    env_scale = _os.environ.get("XESIM_TX_RATE_SCALE")
-    if env_scale is not None:
-        tx_scale = float(env_scale)
     else:
-        tx_scale = float(transcripts_priors.get("tx_rate_scale_default", 1.0))
-    df = sample_scene_transcripts(
-        priors=transcripts_priors,
-        scene=mech_scene,
-        rng=rng,
-        pixel_size_um=float(mech_scene.pixel_size),
-        tx_rate_scale=tx_scale,
-    )
-    # Annotate is_ghost from MechanisticCell provenance
+        from ..transcripts import sample_scene_transcripts
+        import os as _os
+        # Per-cell tx-rate calibration. Precedence (highest first):
+        #   1. XESIM_TX_RATE_SCALE env var (debug override)
+        #   2. transcripts_priors["tx_rate_scale_default"] (baked-in per-
+        #      bundle calibration from fit-priors)
+        #   3. 1.0 (no scaling)
+        # Why: cellAdmix-fit per-type negbin means match real per-cell tx
+        # exactly, but per-tile sampling loses ~13-20% to visible_fraction
+        # scaling at tile boundaries. The default lets each bundle bake in
+        # its measured loss factor; explain stays single-knob from the CLI.
+        env_scale = _os.environ.get("XESIM_TX_RATE_SCALE")
+        if env_scale is not None:
+            tx_scale = float(env_scale)
+        else:
+            tx_scale = float(transcripts_priors.get("tx_rate_scale_default", 1.0))
+        df = sample_scene_transcripts(
+            priors=transcripts_priors,
+            scene=mech_scene,
+            rng=rng,
+            pixel_size_um=float(mech_scene.pixel_size),
+            tx_rate_scale=tx_scale,
+        )
+
+    # ---- xeSim post-processing (applies to both backends) ----
+    # Rename to the schema downstream code (bundle writer, provenance file)
+    # expects. Then annotate is_ghost from MechanisticCell provenance.
     cell_id_to_is_ghost = {
         c.cell_id: bool(c.provenance.get("is_ghost", False))
         for c in mech_scene.cells
