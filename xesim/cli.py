@@ -711,6 +711,27 @@ def _generate(args: argparse.Namespace) -> None:
     print(f"Wrote {len(paths)} scene(s) → {out_dir}")
 
 
+def _reemit_molecules(args: argparse.Namespace) -> None:
+    """CLI handler for ``xesim re-emit-molecules``.
+
+    Thin wrapper that delegates to ``emission_stpuppeteer.reemit.reemit_molecules``;
+    handles user-facing argument validation + progress printing.
+    """
+    from .emission_stpuppeteer.reemit import reemit_molecules
+    print(f"[re-emit] source bundle: {args.bundle}")
+    print(f"[re-emit] writing to:    {args.out}")
+    print(f"[re-emit] config:        {args.stpuppeteer_config}")
+    result = reemit_molecules(
+        src_bundle=args.bundle,
+        out_bundle=args.out,
+        stpuppeteer_config=args.stpuppeteer_config,
+        seed=args.seed,
+    )
+    print(f"[re-emit] done. scene_mode={result.scene_mode} "
+          f"n_cells={result.n_cells} n_transcripts={result.n_transcripts:,}")
+    print(f"[re-emit] output: {result.out_dir}")
+
+
 def _inspect_bundle(args: argparse.Namespace) -> None:
     info = inspect_bundle(args.bundle)
     print(json.dumps(info, indent=2, default=str))
@@ -980,6 +1001,23 @@ def build_parser() -> argparse.ArgumentParser:
                        help="crop_id within --guide-bundle to use as guide")
     gen.add_argument("--device", default=None)
     gen.set_defaults(func=_generate)
+
+    # re-emit-molecules — re-sample transcripts on an existing synth bundle.
+    re = sub.add_parser(
+        "re-emit-molecules", parents=[diag_parent],
+        help="Re-sample transcripts on an existing synth bundle without "
+             "re-rendering. Copies SRC to --out and rewrites only "
+             "transcripts.parquet + ground_truth/molecule_provenance.parquet "
+             "against the supplied STpuppeteer config. --out must not exist.")
+    re.add_argument("bundle", help="path to existing xeSim synth bundle (SRC)")
+    re.add_argument("--out", required=True,
+                       help="path to write the new bundle. Must not exist.")
+    re.add_argument("--stpuppeteer-config", dest="stpuppeteer_config",
+                       required=True,
+                       help="path to STpuppeteer YAML config")
+    re.add_argument("--seed", type=int, default=0,
+                       help="RNG seed (same config + seed → identical output)")
+    re.set_defaults(func=_reemit_molecules)
 
     # inspect-bundle
     ib = sub.add_parser("inspect-bundle", help="Print summary info for a Xenium bundle")
