@@ -131,9 +131,22 @@ def build_scene_25d(
 
     rng = rng or np.random.default_rng(0)
     from ..xenium import resolve_bundle
+    import math as _math
     bundle = resolve_bundle(str(bundle_path))
     psz = float(bundle.pixel_size)
     xmin, ymin, xmax, ymax = scene_bounds_um
+    # Snap scene bounds to pixel grid. Without this, the per-tile renderer
+    # rasterizes at floor(tx0/psz)*psz starting µm but the stitcher places
+    # the tile at the float-µm position — constant 0–psz/2 µm shift
+    # propagates through the whole bundle (visible as polygon-vs-rendered
+    # cell misalignment). 2.5D whole-bundle uses cell-vertex-min as xmin
+    # which is typically NOT pixel-aligned (e.g. pancreas xmin=3.0, psz=0.2125
+    # → 14.117 pixels, not integer).
+    xmin = _math.floor(xmin / psz) * psz
+    ymin = _math.floor(ymin / psz) * psz
+    xmax = _math.ceil(xmax / psz) * psz
+    ymax = _math.ceil(ymax / psz) * psz
+    scene_bounds_um = (xmin, ymin, xmax, ymax)
     W_um = xmax - xmin; H_um = ymax - ymin
     W_full = int(round(W_um / psz))
     H_full = int(round(H_um / psz))
