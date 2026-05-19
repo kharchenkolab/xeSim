@@ -63,7 +63,6 @@ def emit_decisions(
         sample_counts_program_model,
         counts_to_transcript_df,
         classify_leakage,
-        build_program_gpar_df,
     )
 
     if len(cell_gdf) == 0:
@@ -89,19 +88,14 @@ def emit_decisions(
         trs_df["compartment"] = pd.array([], dtype="object")
         return trs_df
 
-    # Step 3: per-transcript Bernoulli leakage via the union rule.
-    # classify_leakage needs gpar_df["gene_leakage"]; build_program_gpar_df
-    # produces that column from cfg.leakage_by_gene (populating zeros where
-    # absent). This also gives us per-gene summaries we could attach for
-    # diagnostics, but for counts we only need the leakage column.
-    gpar_df = build_program_gpar_df(cfg)
-    # gene_leakage column is added by SpotlessSimulator's
-    # _add_gene_leakage_column; replicate that minimal step here so we
-    # don't depend on simulator state. cfg.leakage_by_gene is None by
-    # default (no per-gene leakage) — in that case classify_leakage
-    # treats every gene as 0 and the cell-type rate dominates.
-    gpar_df["gene_leakage"] = _resolve_gene_leakage(cfg, gene_names)
-
+    # Step 3: per-transcript Bernoulli leakage. classify_leakage only reads
+    # gpar_df["gene_leakage"]; build a minimal 2-column frame from
+    # cfg.leakage_by_gene rather than calling build_program_gpar_df, whose
+    # μ/Φ/z-score columns we don't use.
+    gpar_df = pd.DataFrame({
+        "feature_name": gene_names,
+        "gene_leakage": _resolve_gene_leakage(cfg, gene_names),
+    })
     is_leaked = classify_leakage(trs_df, cell_gdf, gpar_df, rng)
     trs_df["is_leaked"] = is_leaked
 
