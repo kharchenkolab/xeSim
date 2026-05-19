@@ -13,8 +13,9 @@ per-cell type labels — in real work use your own).
 
 ### 1a. Xenium bundle
 
-Pancreas membrane, 377-gene panel. From the public 10x Genomics datasets
-page:
+Pancreas membrane, 377-gene panel. Public 10x Genomics dataset:
+[FFPE Human Pancreas with Xenium Multimodal Cell Segmentation](https://www.10xgenomics.com/datasets/ffpe-human-pancreas-with-xenium-multimodal-cell-segmentation-1-standard).
+Direct download:
 
 ```bash
 mkdir -p data && cd data
@@ -28,8 +29,8 @@ After unzipping you should have `Xenium_pancreas/` containing
 
 ### 1b. Annotations
 
-The matching cell-type and domain annotations are mirrored at
-`pklab.org`:
+The matching cell-type and domain annotations live at
+[pklab.org/peterk/cellAdmix/examples/pancreas_377/annotations](http://pklab.org/peterk/cellAdmix/examples/pancreas_377/annotations):
 
 ```bash
 mkdir -p Xenium_pancreas/annotations && cd Xenium_pancreas/annotations
