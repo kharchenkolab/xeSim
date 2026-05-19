@@ -31,15 +31,19 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# Files re-emit rewrites; if the bundle was cloned with hardlinks we have
-# to unlink these before writing, otherwise the writes would silently
-# mutate the source bundle's inodes.
+# Parquet/csv files re-emit fully rewrites via pandas to_parquet / to_csv.
+# When the bundle was cloned with hardlinks we unlink these so writes
+# don't mutate the source bundle's inodes.
 _REWRITTEN_FILES = (
     "transcripts.parquet",
     "transcripts.csv.gz",
-    "experiment.xenium",
     "ground_truth/molecule_provenance.parquet",
 )
+# experiment.xenium is read by load_bundle THEN updated in place by
+# _update_experiment_metadata; we can't unlink it pre-load. Real-copy it
+# during the clone so the read finds it and the later in-place write
+# breaks no link.
+_REAL_COPY_FILES = ("experiment.xenium",)
 
 
 def _clone_bundle(src: Path, out: Path, use_hard_links: bool) -> None:
@@ -47,10 +51,10 @@ def _clone_bundle(src: Path, out: Path, use_hard_links: bool) -> None:
 
     With ``use_hard_links=True`` we run ``cp -al`` (Linux/macOS) so the
     20-GB morphology image and other static files are linked, not copied —
-    the clone takes ~1s regardless of bundle size. Files we're going to
-    rewrite are then unlinked so writes break the link and don't touch
-    the source bundle. Falls back to ``shutil.copytree`` if ``cp`` is
-    missing or the hardlink clone fails (e.g., cross-filesystem).
+    the clone takes ~1s regardless of bundle size. Files re-emit fully
+    rewrites are unlinked after the link clone; files re-emit updates
+    in place are real-copied. Falls back to ``shutil.copytree`` if ``cp``
+    is missing or the hardlink clone fails (e.g., cross-filesystem).
     """
     if not use_hard_links:
         shutil.copytree(src, out)
@@ -64,13 +68,17 @@ def _clone_bundle(src: Path, out: Path, use_hard_links: bool) -> None:
             shutil.rmtree(out)
         shutil.copytree(src, out)
         return
-    # Break links on the files we'll overwrite so writes don't mutate
-    # source inodes. Missing files are fine — not every bundle has all
-    # of them (e.g., 2.5D bundles may not produce transcripts.csv.gz).
     for rel in _REWRITTEN_FILES:
         p = out / rel
         if p.exists():
             os.unlink(p)
+    for rel in _REAL_COPY_FILES:
+        p_src = src / rel
+        p_out = out / rel
+        if p_src.exists():
+            if p_out.exists():
+                os.unlink(p_out)
+            shutil.copy2(p_src, p_out)
 
 
 # ---------------------------------------------------------------------------

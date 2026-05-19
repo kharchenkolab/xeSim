@@ -354,8 +354,10 @@ def load_bundle(bundle_dir: str | Path) -> LoadedBundle:
         )
     elif meta.scene_mode == "2d":
         records = build_cell_records_2d(bundle_dir, meta)
-        cell_label = rasterize_2d(records, bundle_dir, meta, use_nuclei=False)
-        nucleus_label = rasterize_2d(records, bundle_dir, meta, use_nuclei=True)
+        cell_label = _load_or_rasterize_2d(
+            records, bundle_dir, meta, use_nuclei=False)
+        nucleus_label = _load_or_rasterize_2d(
+            records, bundle_dir, meta, use_nuclei=True)
         return LoadedBundle(
             meta=meta, cells=records,
             cell_label=cell_label,
@@ -365,3 +367,59 @@ def load_bundle(bundle_dir: str | Path) -> LoadedBundle:
     else:
         raise ValueError(f"unknown scene_mode {meta.scene_mode!r} "
                          f"in experiment.xenium synth_metadata")
+
+
+# ---------------------------------------------------------------------------
+# Cached rasterisation: skip the per-polygon redraw on subsequent loads
+# ---------------------------------------------------------------------------
+
+
+def _expected_shape_2d(meta) -> tuple[int, int]:
+    xmin, ymin, xmax, ymax = meta.tile_bounds_um
+    psz = meta.pixel_size_um
+    return (int(round((ymax - ymin) / psz)),
+            int(round((xmax - xmin) / psz)))
+
+
+def _load_or_rasterize_2d(records, bundle_dir, meta, *, use_nuclei: bool) -> np.ndarray:
+    """Return the cached rasterised label array if present, else rasterise
+    once and persist it to ``ground_truth/`` for subsequent loads.
+
+    Polygon rasterisation of a 140k-cell pancreas bundle takes ~5–7 min
+    on one core; caching turns that into ~1 s mmap-load on every
+    subsequent re-emit. Cache is regenerated whenever the shape disagrees
+    with what ``meta`` would imply (defensive against bundle edits) or
+    when the file is missing.
+    """
+    name = "nucleus_label.npy" if use_nuclei else "cell_label.npy"
+    cache_path = Path(bundle_dir) / "ground_truth" / name
+    expected = _expected_shape_2d(meta)
+    # Source polygon files — cache is stale if any is newer than the cache.
+    poly_sources = []
+    if use_nuclei:
+        poly_sources.append(Path(bundle_dir) / "nucleus_boundaries.parquet")
+        gp = Path(bundle_dir) / "ground_truth" / "ghost_nucleus_boundaries.parquet"
+        if gp.exists(): poly_sources.append(gp)
+    else:
+        poly_sources.append(Path(bundle_dir) / "cell_boundaries.parquet")
+        gp = Path(bundle_dir) / "ground_truth" / "ghost_cell_boundaries.parquet"
+        if gp.exists(): poly_sources.append(gp)
+    if cache_path.exists():
+        try:
+            cache_mtime = cache_path.stat().st_mtime
+            stale = any(p.stat().st_mtime > cache_mtime
+                            for p in poly_sources if p.exists())
+            if not stale:
+                arr = np.load(cache_path, mmap_mode="r")
+                if arr.shape == expected:
+                    return arr
+        except Exception:
+            pass  # corrupt cache; fall through to regeneration
+    arr = rasterize_2d(records, bundle_dir, meta, use_nuclei=use_nuclei)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, arr)
+    except OSError:
+        # Read-only bundle, etc. — silently skip caching; re-emit still works.
+        pass
+    return arr

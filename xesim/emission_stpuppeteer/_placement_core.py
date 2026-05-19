@@ -20,21 +20,11 @@ See §4 of tmp/cellAdmix-integration.md for the model. Brief summary:
 The per-cell-independent halos let cells' density contributions ADD in
 overlapping regions, and a transcript from A can land inside cell B
 (``landed_in_cell_id`` records that for ground truth).
-
-Parallelism: the per-cell loop is embarrassingly parallel. We run it
-under a ``ThreadPoolExecutor``; scipy's ``distance_transform_edt``
-releases the GIL, so threads give near-linear speedup with no pickling
-overhead. Output buffers are pre-allocated and each cell writes
-disjoint row indices, so no locking is needed. Per-cell child RNGs are
-spawned from the master RNG upfront, making the parallel result
-deterministic for a given seed regardless of worker count.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Sequence
 
 import numpy as np
@@ -42,20 +32,6 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt, find_objects
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_num_workers(n_groups: int) -> int:
-    """Pick a sensible thread count: env override, else cpu_count, capped
-    by the number of cells (no point spinning idle workers)."""
-    env = os.environ.get("XESIM_EMIT_NUM_WORKERS")
-    if env:
-        try:
-            n = max(1, int(env))
-        except ValueError:
-            n = 1
-    else:
-        n = os.cpu_count() or 1
-    return max(1, min(n, n_groups))
 
 
 def place_via_per_cell_sdf(
@@ -151,23 +127,14 @@ def place_via_per_cell_sdf(
     for lab in list(groups.keys()):
         groups[lab] = np.asarray(groups[lab], dtype=np.int64)
 
-    # Hoist is_leaked out of pandas into a single numpy array — keeps the
-    # parallel per-cell worker GIL-free (it only does numpy + scipy work).
     is_leaked_all = trs_df["is_leaked"].to_numpy(dtype=bool)
 
-    # Per-cell child RNGs spawned upfront from the master rng. Independent
-    # streams → thread-safe + deterministic for a given seed regardless of
-    # worker count or scheduling order.
-    items = list(groups.items())
-    child_rngs = rng.spawn(len(items))
-
-    def _place_one(arg):
-        (lab, row_idx), child_rng = arg
+    for lab, row_idx in groups.items():
         if lab <= 0 or lab > len(bboxes):
-            return
+            continue
         bbox = bboxes[lab - 1]
         if bbox is None:
-            return
+            continue
         is_leaked = is_leaked_all[row_idx]
         n_leak = int(is_leaked.sum())
         n_inside = int((~is_leaked).sum())
@@ -176,11 +143,9 @@ def place_via_per_cell_sdf(
         if n_inside > 0:
             inside_local = np.argwhere(cell_label[bbox] == lab)
             if inside_local.shape[0] == 0:
-                # Defensive: bbox exists but no voxels match. Shouldn't
-                # happen post-find_objects.
-                return
+                continue
             offset = np.array([s.start for s in bbox], dtype=np.int64)
-            picks = child_rng.integers(0, inside_local.shape[0], size=n_inside)
+            picks = rng.integers(0, inside_local.shape[0], size=n_inside)
             voxels_inside = inside_local[picks] + offset
             inside_row_idx = row_idx[~is_leaked]
             voxel_coords[inside_row_idx] = voxels_inside
@@ -199,19 +164,17 @@ def place_via_per_cell_sdf(
                 )
                 inside_local = np.argwhere(cell_label[bbox] == lab)
                 if inside_local.shape[0] == 0:
-                    return
+                    continue
                 offset = np.array([s.start for s in bbox], dtype=np.int64)
-                picks = child_rng.integers(0, inside_local.shape[0], size=n_leak)
+                picks = rng.integers(0, inside_local.shape[0], size=n_leak)
                 voxels_leak = inside_local[picks] + offset
                 leak_row_idx = row_idx[is_leaked]
                 voxel_coords[leak_row_idx] = voxels_leak
                 landed_in_label[leak_row_idx] = lab
-                return
+                continue
 
             expanded = _expand_bbox(bbox, max_d, sampling, cell_label.shape)
             mask_c_local = cell_label[expanded] == lab
-            # `distance_transform_edt` is C code that releases the GIL —
-            # this is the call that makes thread-based parallelism worth it.
             d_to_c = distance_transform_edt(~mask_c_local, sampling=sampling)
             in_range = (d_to_c > 0) & (d_to_c < max_d)
             local_coords = np.argwhere(in_range)
@@ -222,33 +185,24 @@ def place_via_per_cell_sdf(
                 )
                 inside_local = np.argwhere(mask_c_local)
                 if inside_local.shape[0] == 0:
-                    return
-                picks = child_rng.integers(0, inside_local.shape[0], size=n_leak)
+                    continue
+                picks = rng.integers(0, inside_local.shape[0], size=n_leak)
                 voxels_leak_local = inside_local[picks]
             else:
                 d_in_range = d_to_c[in_range]
                 w = np.exp(-d_in_range / lam)
                 w_sum = w.sum()
                 if w_sum <= 0.0:
-                    picks = child_rng.integers(0, local_coords.shape[0], size=n_leak)
+                    picks = rng.integers(0, local_coords.shape[0], size=n_leak)
                 else:
                     w /= w_sum
-                    picks = child_rng.choice(local_coords.shape[0], size=n_leak, p=w)
+                    picks = rng.choice(local_coords.shape[0], size=n_leak, p=w)
                 voxels_leak_local = local_coords[picks]
             offset = np.array([s.start for s in expanded], dtype=np.int64)
             voxels_leak = voxels_leak_local + offset
             leak_row_idx = row_idx[is_leaked]
             voxel_coords[leak_row_idx] = voxels_leak
             landed_in_label[leak_row_idx] = cell_label[tuple(voxels_leak.T)]
-
-    n_workers = _resolve_num_workers(len(items))
-    if n_workers == 1 or len(items) <= 1:
-        for arg in zip(items, child_rngs):
-            _place_one(arg)
-    else:
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            # list() forces evaluation so any worker exception surfaces here.
-            list(pool.map(_place_one, zip(items, child_rngs)))
 
     # ---- Convert voxel indices → µm with sub-voxel jitter ----
     # Jitter is uniform in ±half_voxel along each axis (matches xeSim's
