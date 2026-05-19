@@ -93,6 +93,17 @@ def _load_polygons_by_id(parquet_path: Path) -> dict[str, np.ndarray]:
     return out
 
 
+def _load_cell_ids(parquet_path: Path) -> set[str]:
+    """Return the set of cell_ids present in a boundary parquet.
+
+    Reads only the cell_id column — ~200× faster than _load_polygons_by_id
+    when the caller just needs to check "is this cell_id present?" (which
+    is all build_cell_records_2d does with its polygon dicts).
+    """
+    df = pd.read_parquet(parquet_path, columns=["cell_id"])
+    return set(df["cell_id"].astype(str).unique())
+
+
 def _load_cells_synth(bundle_dir: Path) -> pd.DataFrame:
     """Read ground_truth/cells_synth.parquet — cell_type + provenance."""
     return pd.read_parquet(bundle_dir / "ground_truth" / "cells_synth.parquet")
@@ -233,22 +244,22 @@ def build_cell_records_2d(
     we mirror that by walking cells_synth in row order.
     """
     cells_synth = _load_cells_synth(bundle_dir)
-    anchor_polys = _load_polygons_by_id(bundle_dir / "cell_boundaries.parquet")
-    # Ghost polygons live in a separate file (per scene_2d/bundle_writer.py:20);
-    # absent when the original explain ran with --no-ghosts.
+    # Only need a membership set here — the per-cell polygon vertices are
+    # read separately by rasterize_2d. _load_cell_ids skips the
+    # column-vertex parsing that made _load_polygons_by_id the dominant
+    # cost of warm-cache re-emits (~175s → ~1s on the pancreas bundle).
+    anchor_ids = _load_cell_ids(bundle_dir / "cell_boundaries.parquet")
     ghost_path = bundle_dir / "ground_truth" / "ghost_cell_boundaries.parquet"
-    ghost_polys = (_load_polygons_by_id(ghost_path)
-                       if ghost_path.exists() else {})
+    ghost_ids = _load_cell_ids(ghost_path) if ghost_path.exists() else set()
 
     records: list = []
     for i, row in enumerate(cells_synth.itertuples(index=False), start=1):
         cid = str(row.cell_id)
         is_ghost = bool(getattr(row, "is_ghost", False))
-        # Lookup polygon in the right pool. Skip with a debug note rather
-        # than warn — a bundle generated with --no-ghosts still has rows
-        # in cells_synth flagged is_ghost=True if any tier-2 retyping
-        # left them there, but we don't have geometry to rasterise them.
-        pool = ghost_polys if is_ghost else anchor_polys
+        # A bundle generated with --no-ghosts still has rows in cells_synth
+        # flagged is_ghost=True if any tier-2 retyping left them there, but
+        # we don't have geometry to rasterise them — silently skip.
+        pool = ghost_ids if is_ghost else anchor_ids
         if cid not in pool:
             continue
         records.append(SimpleNamespace(
