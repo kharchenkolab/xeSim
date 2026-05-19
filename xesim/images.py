@@ -202,7 +202,12 @@ def _first_plane(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
     while arr.ndim > 2:
         arr = arr[0]
-    return arr.astype(np.float32, copy=False)
+    # Keep the cached plane in its NATIVE dtype (typically uint16). The
+    # consumer (OmeCropReader.read) casts the per-tile slice to float32.
+    # Float32-casting the whole plane here doubled the cache footprint —
+    # on a breast 5K bundle that meant 15.4 GB / channel × 4 channels × 3
+    # workers = >180 GB and OOM. uint16 native keeps it at ~30 GB total.
+    return arr
 
 
 def read_channel_stack(paths: Sequence[Path], crop: CropBox, pixel_size: float) -> np.ndarray:
