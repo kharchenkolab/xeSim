@@ -20,11 +20,21 @@ See §4 of tmp/cellAdmix-integration.md for the model. Brief summary:
 The per-cell-independent halos let cells' density contributions ADD in
 overlapping regions, and a transcript from A can land inside cell B
 (``landed_in_cell_id`` records that for ground truth).
+
+Parallelism: the per-cell loop is embarrassingly parallel. We run it
+under a ``ThreadPoolExecutor``; scipy's ``distance_transform_edt``
+releases the GIL, so threads give near-linear speedup with no pickling
+overhead. Output buffers are pre-allocated and each cell writes
+disjoint row indices, so no locking is needed. Per-cell child RNGs are
+spawned from the master RNG upfront, making the parallel result
+deterministic for a given seed regardless of worker count.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Sequence
 
 import numpy as np
@@ -32,6 +42,20 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt, find_objects
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_num_workers(n_groups: int) -> int:
+    """Pick a sensible thread count: env override, else cpu_count, capped
+    by the number of cells (no point spinning idle workers)."""
+    env = os.environ.get("XESIM_EMIT_NUM_WORKERS")
+    if env:
+        try:
+            n = max(1, int(env))
+        except ValueError:
+            n = 1
+    else:
+        n = os.cpu_count() or 1
+    return max(1, min(n, n_groups))
 
 
 def place_via_per_cell_sdf(
@@ -127,17 +151,24 @@ def place_via_per_cell_sdf(
     for lab in list(groups.keys()):
         groups[lab] = np.asarray(groups[lab], dtype=np.int64)
 
-    psz_x = float(sampling[-1])  # for sub-voxel jitter scale on (x,y) axes
+    # Hoist is_leaked out of pandas into a single numpy array — keeps the
+    # parallel per-cell worker GIL-free (it only does numpy + scipy work).
+    is_leaked_all = trs_df["is_leaked"].to_numpy(dtype=bool)
 
-    for lab, row_idx in groups.items():
+    # Per-cell child RNGs spawned upfront from the master rng. Independent
+    # streams → thread-safe + deterministic for a given seed regardless of
+    # worker count or scheduling order.
+    items = list(groups.items())
+    child_rngs = rng.spawn(len(items))
+
+    def _place_one(arg):
+        (lab, row_idx), child_rng = arg
         if lab <= 0 or lab > len(bboxes):
-            continue
+            return
         bbox = bboxes[lab - 1]
         if bbox is None:
-            continue
-
-        sub_trs = trs_df.iloc[row_idx]
-        is_leaked = sub_trs["is_leaked"].to_numpy(dtype=bool)
+            return
+        is_leaked = is_leaked_all[row_idx]
         n_leak = int(is_leaked.sum())
         n_inside = int((~is_leaked).sum())
 
@@ -147,18 +178,14 @@ def place_via_per_cell_sdf(
             if inside_local.shape[0] == 0:
                 # Defensive: bbox exists but no voxels match. Shouldn't
                 # happen post-find_objects.
-                continue
+                return
             offset = np.array([s.start for s in bbox], dtype=np.int64)
-            picks = rng.integers(0, inside_local.shape[0], size=n_inside)
+            picks = child_rng.integers(0, inside_local.shape[0], size=n_inside)
             voxels_inside = inside_local[picks] + offset
             inside_row_idx = row_idx[~is_leaked]
             voxel_coords[inside_row_idx] = voxels_inside
-            # Nucleus overlap check by looking up nucleus_label at each voxel.
-            # Multi-dim indexing via tuple of per-axis arrays.
             nuc_vals = nucleus_label[tuple(voxels_inside.T)]
             overlaps_nuc[inside_row_idx] = (nuc_vals == lab).astype(np.uint8)
-            # Non-leaked: landed_in_cell_id stays 0 (interpreted as
-            # "transcript is inside its own source cell").
             landed_in_label[inside_row_idx] = lab
 
         # ---- Leaked placement: per-cell bounded SDF ----
@@ -166,74 +193,62 @@ def place_via_per_cell_sdf(
             lam = float(leak_lam_per_cell.get(lab, 0.0))
             max_d = float(max_dist_per_cell.get(lab, 0.0))
             if lam <= 0.0 or max_d <= 0.0:
-                # No leakage configured for this cell type. Should not
-                # happen because is_leaked is True only when p_eff > 0,
-                # but be defensive: treat the leaked transcripts as
-                # interior fallback (still inside the cell).
                 logger.debug(
                     "Cell %d has is_leaked transcripts but λ or max_dist <= 0; "
                     "falling through to interior placement.", lab
                 )
                 inside_local = np.argwhere(cell_label[bbox] == lab)
                 if inside_local.shape[0] == 0:
-                    continue
+                    return
                 offset = np.array([s.start for s in bbox], dtype=np.int64)
-                picks = rng.integers(0, inside_local.shape[0], size=n_leak)
+                picks = child_rng.integers(0, inside_local.shape[0], size=n_leak)
                 voxels_leak = inside_local[picks] + offset
                 leak_row_idx = row_idx[is_leaked]
                 voxel_coords[leak_row_idx] = voxels_leak
                 landed_in_label[leak_row_idx] = lab
-                continue
+                return
 
-            # Expand bbox by ⌈max_d / sampling⌉ voxels on every axis to
-            # capture the full halo support around this cell.
             expanded = _expand_bbox(bbox, max_d, sampling, cell_label.shape)
             mask_c_local = cell_label[expanded] == lab
-            # Distance from every voxel in the expanded bbox to cell c's
-            # surface (interior of c is 0, everywhere else is positive).
-            # NOTE: ~mask_c_local means "outside cell c" — we measure
-            # distance from voxels-outside-c to the nearest c-voxel. Other
-            # cells' bodies are not excluded; their voxels just have a
-            # positive distance to c, same as true exterior voxels.
+            # `distance_transform_edt` is C code that releases the GIL —
+            # this is the call that makes thread-based parallelism worth it.
             d_to_c = distance_transform_edt(~mask_c_local, sampling=sampling)
-            # In-range halo mask: outside c AND within max_dist.
             in_range = (d_to_c > 0) & (d_to_c < max_d)
             local_coords = np.argwhere(in_range)
             if local_coords.shape[0] == 0:
-                # Halo is empty (cell is isolated and tile is too small),
-                # or pathological. Fall back to interior placement so we
-                # don't lose the transcripts entirely.
                 logger.debug(
                     "Cell %d: empty halo within max_dist=%.2f µm; "
                     "falling back to interior placement.", lab, max_d
                 )
                 inside_local = np.argwhere(mask_c_local)
                 if inside_local.shape[0] == 0:
-                    continue
-                picks = rng.integers(0, inside_local.shape[0], size=n_leak)
+                    return
+                picks = child_rng.integers(0, inside_local.shape[0], size=n_leak)
                 voxels_leak_local = inside_local[picks]
             else:
-                # Weight voxels by exp(-d/λ) and sample with replacement.
                 d_in_range = d_to_c[in_range]
                 w = np.exp(-d_in_range / lam)
                 w_sum = w.sum()
                 if w_sum <= 0.0:
-                    # All weights underflowed — shouldn't happen with
-                    # reasonable λ but be defensive.
-                    picks = rng.integers(0, local_coords.shape[0], size=n_leak)
+                    picks = child_rng.integers(0, local_coords.shape[0], size=n_leak)
                 else:
                     w /= w_sum
-                    picks = rng.choice(local_coords.shape[0], size=n_leak, p=w)
+                    picks = child_rng.choice(local_coords.shape[0], size=n_leak, p=w)
                 voxels_leak_local = local_coords[picks]
             offset = np.array([s.start for s in expanded], dtype=np.int64)
             voxels_leak = voxels_leak_local + offset
             leak_row_idx = row_idx[is_leaked]
             voxel_coords[leak_row_idx] = voxels_leak
-            # Record which cell's volume each leaked transcript landed in
-            # (0 = true exterior, lab' = inside neighbour cell lab').
             landed_in_label[leak_row_idx] = cell_label[tuple(voxels_leak.T)]
-            # Leaked transcripts don't get the overlaps_nucleus flag —
-            # by definition they're outside their source cell.
+
+    n_workers = _resolve_num_workers(len(items))
+    if n_workers == 1 or len(items) <= 1:
+        for arg in zip(items, child_rngs):
+            _place_one(arg)
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            # list() forces evaluation so any worker exception surfaces here.
+            list(pool.map(_place_one, zip(items, child_rngs)))
 
     # ---- Convert voxel indices → µm with sub-voxel jitter ----
     # Jitter is uniform in ±half_voxel along each axis (matches xeSim's

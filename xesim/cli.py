@@ -730,6 +730,7 @@ def _reemit_molecules(args: argparse.Namespace) -> None:
         out_bundle=args.out,
         stpuppeteer_config=args.stpuppeteer_config,
         seed=args.seed,
+        use_hard_links=bool(getattr(args, "use_hard_links", False)),
     )
     print(f"[re-emit] done. scene_mode={result.scene_mode} "
           f"n_cells={result.n_cells} n_transcripts={result.n_transcripts:,}")
@@ -1130,6 +1131,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="path to STpuppeteer YAML config")
     re.add_argument("--seed", type=int, default=0,
                        help="RNG seed (same config + seed → identical output)")
+    re.add_argument("--use-hard-links", dest="use_hard_links",
+                       action="store_true",
+                       help="clone the source bundle with hardlinks (cp -al) "
+                            "instead of a full byte-copy. Skips the multi-GB "
+                            "copy of morphology.ome.tif. Off by default. "
+                            "Source bundle is never modified either way.")
     re.set_defaults(func=_reemit_molecules)
 
     # diagnostics — emit panels against artifacts that already exist on disk.

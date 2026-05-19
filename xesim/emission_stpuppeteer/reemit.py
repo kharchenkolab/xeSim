@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +29,48 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+# Files re-emit rewrites; if the bundle was cloned with hardlinks we have
+# to unlink these before writing, otherwise the writes would silently
+# mutate the source bundle's inodes.
+_REWRITTEN_FILES = (
+    "transcripts.parquet",
+    "transcripts.csv.gz",
+    "experiment.xenium",
+    "ground_truth/molecule_provenance.parquet",
+)
+
+
+def _clone_bundle(src: Path, out: Path, use_hard_links: bool) -> None:
+    """Materialize a copy of ``src`` at ``out`` for re-emit to write into.
+
+    With ``use_hard_links=True`` we run ``cp -al`` (Linux/macOS) so the
+    20-GB morphology image and other static files are linked, not copied —
+    the clone takes ~1s regardless of bundle size. Files we're going to
+    rewrite are then unlinked so writes break the link and don't touch
+    the source bundle. Falls back to ``shutil.copytree`` if ``cp`` is
+    missing or the hardlink clone fails (e.g., cross-filesystem).
+    """
+    if not use_hard_links:
+        shutil.copytree(src, out)
+        return
+    try:
+        subprocess.run(["cp", "-al", str(src), str(out)], check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        logger.warning(
+            "cp -al failed (%s); falling back to full byte-copy", e)
+        if out.exists():
+            shutil.rmtree(out)
+        shutil.copytree(src, out)
+        return
+    # Break links on the files we'll overwrite so writes don't mutate
+    # source inodes. Missing files are fine — not every bundle has all
+    # of them (e.g., 2.5D bundles may not produce transcripts.csv.gz).
+    for rel in _REWRITTEN_FILES:
+        p = out / rel
+        if p.exists():
+            os.unlink(p)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +93,7 @@ def reemit_molecules(
     *,
     stpuppeteer_config: str | Path,
     seed: int = 0,
+    use_hard_links: bool = False,
 ) -> ReemitResult:
     """Re-emit transcripts for an existing synth bundle.
 
@@ -57,13 +102,23 @@ def reemit_molecules(
     src_bundle : path
         Existing xeSim explain output (2D or 2.5D).
     out_bundle : path
-        New output directory; **must not exist**. Source is copied here
+        New output directory; **must not exist**. Source is cloned here
         first, then the transcripts files are overwritten.
     stpuppeteer_config : path
         Path to STpuppeteer YAML config.
     seed : int
         RNG seed for the emission step. Same config + same seed →
         byte-identical output.
+    use_hard_links : bool
+        If True, clone the bundle with ``cp -al`` (hardlinks) instead of a
+        full byte-copy. Skips the multi-GB copy of ``morphology.ome.tif``
+        and other static files. Files we rewrite (transcripts.parquet,
+        transcripts.csv.gz, experiment.xenium, ground_truth/
+        molecule_provenance.parquet) are unlinked after the clone so
+        writes break the link and never touch the source bundle. Falls
+        back to full byte-copy if the hardlink clone fails (cross-fs,
+        missing cp). Off by default — safe default for users who may move
+        the source bundle later.
     """
     src = Path(src_bundle).resolve()
     out = Path(out_bundle).resolve()
@@ -80,11 +135,15 @@ def reemit_molecules(
             "re-emit-molecules never overwrites an existing directory."
         )
 
-    # Step 1: copy bundle wholesale. We overwrite transcripts.parquet +
-    # ground_truth/molecule_provenance.parquet next; everything else is
-    # reused as-is from the source bundle.
-    logger.info("copying %s → %s", src, out)
-    shutil.copytree(src, out)
+    # Step 1: clone bundle. Default is shutil.copytree (full byte-copy);
+    # --use-hard-links uses `cp -al` and unlinks the files we'll rewrite,
+    # which avoids the multi-GB copy of morphology.ome.tif. Source bundle
+    # is never touched either way.
+    if use_hard_links:
+        logger.info("cloning (hardlinks) %s → %s", src, out)
+    else:
+        logger.info("copying %s → %s", src, out)
+    _clone_bundle(src, out, use_hard_links=use_hard_links)
 
     # Step 2: load the (just-copied) bundle. The reader rasterises
     # polygons → cell_label / cell_label_3d, which the emit_* functions
