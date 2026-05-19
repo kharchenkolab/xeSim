@@ -761,10 +761,21 @@ def _write_emission_stpuppeteer_diagnostics(
     if prov_path.exists():
         prov = pd.read_parquet(prov_path)
         if "transcript_id" in tx.columns and "transcript_id" in prov.columns:
-            keep = [c for c in ("true_cell_type", "true_cell_id", "is_ghost")
+            keep = [c for c in ("true_cell_type", "true_cell_id", "is_ghost", "gene")
                        if c in prov.columns]
             tx = tx.merge(prov[["transcript_id", *keep]],
                               on="transcript_id", how="left")
+    # 2D bundle writer only stores `true_cell_id` in provenance — recover
+    # cell type by joining through `ground_truth/cells_synth.parquet`.
+    if "true_cell_type" not in tx.columns and "true_cell_id" in tx.columns:
+        cells_synth_path = bundle / "ground_truth" / "cells_synth.parquet"
+        if cells_synth_path.exists():
+            cs = pd.read_parquet(cells_synth_path)
+            if "cell_type" in cs.columns and "cell_id" in cs.columns:
+                tx = tx.merge(
+                    cs[["cell_id", "cell_type"]].rename(
+                        columns={"cell_id": "true_cell_id", "cell_type": "true_cell_type"}),
+                    on="true_cell_id", how="left")
     if "true_cell_type" in tx.columns and "source_cell_type" not in tx.columns:
         tx = tx.rename(columns={"true_cell_type": "source_cell_type"})
     if "feature_name" in tx.columns and "gene" not in tx.columns:
