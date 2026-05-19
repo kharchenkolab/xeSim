@@ -2,6 +2,11 @@
 
 The three commands cover everything most users will do.
 
+> Prefer a worked example? See
+> [`pancreas_vignette.md`](pancreas_vignette.md) for an end-to-end run
+> on the public Xenium pancreas bundle (download, fit, render a tile,
+> render the whole bundle) with real-vs-synth panels at each step.
+
 ## 0. Install
 
 xeSim has two pieces: the Python package (this repo) and `cellAdmix-core`

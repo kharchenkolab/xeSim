@@ -68,27 +68,53 @@ def channel_names(paths: Sequence[Path]) -> tuple[str, ...]:
     return tuple(names)
 
 
-# Process-wide cache of decompressed morphology planes. Keyed by
-# (absolute path, mtime) so distinct files / re-saves don't alias.
+# Process-wide cache of decompressed morphology planes. Each entry holds
+# `(data, (y_offset_px, x_offset_px))`: a uint16 chunk and its origin in
+# the full plane's coordinates. When `_REGION_HINT_BBOX_PX` is set, the
+# cached chunk covers only that bbox (decompressed lazily via tifffile's
+# zarr view, which reads only the JP2 tiles overlapping the bbox); when
+# unset, the full plane is cached.
+#
 # Bundle morphology TIFFs are JPEG-2000 compressed; decompressing a 64um
-# tile costs ~0.5s wall-clock per channel. Caching the whole plane once
-# per worker amortizes that across all tiles the worker handles. Memory
-# cost: ~3.7GB for a typical 4-channel pancreas bundle.
-_PLANE_CACHE: dict[tuple[str, int], np.ndarray] = {}
+# tile costs ~0.5s wall-clock per channel. Caching the union bbox once
+# per worker amortizes that across all tiles the worker handles.
+# Memory cost scales with bbox size: ~30 GB / worker for the full breast
+# 5K plane, ~4 GB / worker for a 5×5 mm region of the same bundle.
+_PLANE_CACHE: dict[tuple[str, int], tuple[np.ndarray, tuple[int, int]]] = {}
+
+# When set, OmeCropReader decompresses only this bbox (full-plane pixel
+# coords: y0, y1, x0, x1) on first access, instead of the whole plane.
+# Workers call `set_region_hint()` in their init; the serial / single-
+# process path sets it directly before reading. The hint must be a
+# superset of every crop the cache will be asked to serve.
+_REGION_HINT_BBOX_PX: tuple[int, int, int, int] | None = None
 
 
 def clear_plane_cache() -> None:
-    """Drop all cached full planes. Useful in tests / long-running services."""
+    """Drop all cached planes. Useful in tests / long-running services."""
+    _PLANE_CACHE.clear()
+
+
+def set_region_hint(bbox_px: tuple[int, int, int, int] | None) -> None:
+    """Restrict the plane cache to a sub-region of the full TIFF.
+
+    `bbox_px` is `(y0, y1, x0, x1)` in full-plane pixel coordinates, or
+    None to clear the hint. Must be set BEFORE the first crop read; the
+    hint only affects entries decompressed after this call. Existing
+    cached entries are dropped to avoid serving from a stale region.
+    """
+    global _REGION_HINT_BBOX_PX
+    _REGION_HINT_BBOX_PX = bbox_px
     _PLANE_CACHE.clear()
 
 
 class OmeCropReader:
     """Read repeated crops from one OME-TIFF efficiently.
 
-    Process-wide cache (``_PLANE_CACHE``) avoids re-decompressing the same
-    plane on every crop. The first call decompresses and stores the full
-    plane; subsequent calls (in the same process, against the same file)
-    slice from memory. ~10x speedup at whole-bundle scale.
+    Caches the morphology plane (or sub-region, when `set_region_hint`
+    has been called) once per process. The first call decompresses and
+    stores the chunk as native uint16; subsequent calls slice from RAM.
+    Per-tile cost is sub-millisecond once the cache is warm.
     """
 
     def __init__(self, path: Path, pixel_size: float):
@@ -96,13 +122,24 @@ class OmeCropReader:
         self.pixel_size = pixel_size
 
     def read(self, crop: CropBox) -> np.ndarray:
-        plane = self._ensure_full_plane()
-        x0, x1, y0, y1 = crop_pixel_bounds(crop, self.pixel_size, shape=plane.shape)
-        if x1 <= x0 or y1 <= y0:
-            raise ValueError(f"Crop {crop.crop_id} is empty after pixel conversion")
-        return plane[y0:y1, x0:x1].astype(np.float32, copy=False)
+        plane, (oy, ox) = self._ensure_plane()
+        x0, x1, y0, y1 = crop_pixel_bounds(
+            crop, self.pixel_size, shape=None)
+        # Shift into the cached chunk's local coordinates.
+        ly0, ly1 = y0 - oy, y1 - oy
+        lx0, lx1 = x0 - ox, x1 - ox
+        h, w = plane.shape
+        ly0, ly1 = max(0, ly0), max(0, min(h, ly1))
+        lx0, lx1 = max(0, lx0), max(0, min(w, lx1))
+        if lx1 <= lx0 or ly1 <= ly0:
+            raise ValueError(
+                f"Crop {crop.crop_id} is empty in cached chunk "
+                f"(crop bbox in full-plane px: y=[{y0},{y1}] x=[{x0},{x1}]; "
+                f"cached origin (y,x)=({oy},{ox}) shape={plane.shape}). "
+                "If a region hint is set, the crop must lie within it.")
+        return plane[ly0:ly1, lx0:lx1].astype(np.float32, copy=False)
 
-    def _ensure_full_plane(self) -> np.ndarray:
+    def _ensure_plane(self) -> tuple[np.ndarray, tuple[int, int]]:
         import os
         path_str = str(self.path)
         try:
@@ -112,7 +149,12 @@ class OmeCropReader:
         key = (path_str, mtime)
         cached = _PLANE_CACHE.get(key)
         if cached is None:
-            cached = _read_full_plane(self.path)
+            if _REGION_HINT_BBOX_PX is not None:
+                y0, y1, x0, x1 = _REGION_HINT_BBOX_PX
+                data = _read_plane_region(self.path, y0, y1, x0, x1)
+                cached = (data, (y0, x0))
+            else:
+                cached = (_read_full_plane(self.path), (0, 0))
             _PLANE_CACHE[key] = cached
         return cached
 
@@ -198,11 +240,49 @@ def _read_full_plane(path: Path) -> np.ndarray:
     return _first_plane(arr)
 
 
+def _read_plane_region(
+    path: Path, y0: int, y1: int, x0: int, x1: int,
+) -> np.ndarray:
+    """Decompress only the sub-region ``[y0:y1, x0:x1]`` of the first 2D
+    plane. Uses tifffile's zarr-store view so only the JP2 tiles
+    overlapping the bbox are decoded — ~6× faster than a full read on
+    realistic subregions, and uses memory proportional to the bbox.
+    Falls back to a full read on any error.
+    """
+    if tifffile is None:
+        raise RuntimeError("tifffile is required for OME-TIFF image crops")
+    try:
+        import zarr  # type: ignore
+        store = tifffile.imread(path, aszarr=True)
+        try:
+            root = zarr.open(store, mode="r")
+            # Pyramidal Xenium TIFFs expose an array group keyed by level
+            # ("0" is full res). Plain TIFFs come through as an array.
+            top = root["0"] if hasattr(root, "array_keys") else root
+            # Strip leading axes to land on a 2D plane (matches
+            # `_first_plane`): take index 0 along every dim > 2.
+            idx: tuple = (0,) * (top.ndim - 2) + (slice(y0, y1), slice(x0, x1))
+            return np.asarray(top[idx])
+        finally:
+            try: store.close()
+            except Exception: pass
+    except Exception:
+        # Defensive fallback: full-plane read + slice. Loses the memory
+        # win but preserves correctness if the zarr path is unavailable.
+        arr = _read_full_plane(path)
+        return arr[y0:y1, x0:x1].copy()
+
+
 def _first_plane(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr)
     while arr.ndim > 2:
         arr = arr[0]
-    return arr.astype(np.float32, copy=False)
+    # Keep the cached plane in its NATIVE dtype (typically uint16). The
+    # consumer (OmeCropReader.read) casts the per-tile slice to float32.
+    # Float32-casting the whole plane here doubled the cache footprint —
+    # on a breast 5K bundle that meant 15.4 GB / channel × 4 channels × 3
+    # workers = >180 GB and OOM. uint16 native keeps it at ~30 GB total.
+    return arr
 
 
 def read_channel_stack(paths: Sequence[Path], crop: CropBox, pixel_size: float) -> np.ndarray:

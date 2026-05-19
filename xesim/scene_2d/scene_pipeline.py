@@ -46,6 +46,12 @@ def _worker_init_2d(model_path: str, device: str, bundle_path: str, kwargs: dict
     from ..model import XesimModel
     _WORKER_MODEL_2D = XesimModel.load(model_path, device=device)
     _WORKER_BUNDLE_PATH_2D = bundle_path
+    # Pull out the region hint (consumed locally, not forwarded into
+    # explain_region as a kwarg).
+    region_hint = kwargs.pop("_plane_region_hint_px", None)
+    if region_hint is not None:
+        from ..images import set_region_hint
+        set_region_hint(region_hint)
     _WORKER_KWARGS_2D = kwargs
 
 
@@ -462,6 +468,28 @@ def build_scene(
                 f"image {W_total} × {H_total} px = "
                 f"{(W_total*pixel_size):.1f} × {(H_total*pixel_size):.1f} µm")
 
+    # Region-scoped plane-cache hint: when build_scene is asked to cover
+    # only a sub-region of a bundle, the per-worker morphology cache
+    # should hold only that sub-region instead of the full plane (saves
+    # ~25 GB/worker on a 5×5 mm crop of the breast 5K bundle). Build the
+    # pixel bbox from `sb` + the stitch grid size here so the serial and
+    # parallel paths get the same hint; both push it through
+    # `set_region_hint`.
+    import math as _math
+    _pad_px = 16   # safety pad against tile-edge rounding
+    _y0_px = max(0, int(_math.floor(sb[1] / pixel_size)) - _pad_px)
+    _x0_px = max(0, int(_math.floor(sb[0] / pixel_size)) - _pad_px)
+    _hint_bbox_px = (
+        _y0_px, _y0_px + H_total + 2 * _pad_px,
+        _x0_px, _x0_px + W_total + 2 * _pad_px,
+    )
+    if progress:
+        _hh = _hint_bbox_px[1] - _hint_bbox_px[0]
+        _ww = _hint_bbox_px[3] - _hint_bbox_px[2]
+        print(f"[build_scene] morphology cache hint: y=[{_hint_bbox_px[0]},"
+              f"{_hint_bbox_px[1]}] x=[{_hint_bbox_px[2]},{_hint_bbox_px[3]}] "
+              f"({_hh}×{_ww} px per channel)", flush=True)
+
     # Feather-weighted accumulation: value buffer + weight buffer.
     # At the end, stitched = accum_value / accum_weight.
     feather = _feather_mask(tile_px, overlap_px) if overlap_px > 0 else None
@@ -555,6 +583,8 @@ def build_scene(
 
     if num_workers <= 1:
         # Serial path (default)
+        from ..images import set_region_hint as _set_region_hint
+        _set_region_hint(_hint_bbox_px)
         for k in range(len(grid)):
             idx, res = _render_one_tile(k)
             _consume(idx, res)
@@ -589,6 +619,9 @@ def build_scene(
             "ghost_count_scale": ghost_count_scale,
             "emission_backend": emission_backend,
             "stpuppeteer_config": stpuppeteer_config,
+            # Consumed by _worker_init_2d and stripped before being
+            # forwarded into explain_region.
+            "_plane_region_hint_px": _hint_bbox_px,
         }
         with ctx.Pool(processes=num_workers,
                         initializer=_worker_init_2d,

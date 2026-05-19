@@ -719,11 +719,7 @@ def _generate(args: argparse.Namespace) -> None:
 
 
 def _reemit_molecules(args: argparse.Namespace) -> None:
-    """CLI handler for ``xesim re-emit-molecules``.
-
-    Thin wrapper that delegates to ``emission_stpuppeteer.reemit.reemit_molecules``;
-    handles user-facing argument validation + progress printing.
-    """
+    """CLI handler for ``xesim re-emit-molecules``."""
     from .emission_stpuppeteer.reemit import reemit_molecules
     print(f"[re-emit] source bundle: {args.bundle}")
     print(f"[re-emit] writing to:    {args.out}")
@@ -738,8 +734,6 @@ def _reemit_molecules(args: argparse.Namespace) -> None:
           f"n_cells={result.n_cells} n_transcripts={result.n_transcripts:,}")
     print(f"[re-emit] output: {result.out_dir}")
 
-    # --diagnostic [DIR] writes per-cell-type emission stats. Same flag
-    # the rest of the CLI honours; default location is <out>/diagnostics/.
     if getattr(args, "diagnostic", None) is not None:
         from .diagnostics import resolve_diagnostic_dir
         diag_dir = resolve_diagnostic_dir(args.diagnostic, args.out)
@@ -753,14 +747,7 @@ def _write_emission_stpuppeteer_diagnostics(
     stpuppeteer_config: str,
     diag_dir,
 ) -> None:
-    """Compute STpuppeteer-emission diagnostics from a written bundle.
-
-    Reads transcripts.parquet + ground_truth/molecule_provenance.parquet
-    to recover the per-transcript metadata we need (cell type, leakage
-    flag, gene), then loads the config to know which genes are markers
-    for which type. Writes ``emission_stpuppeteer.json`` and prints a
-    compact stdout summary.
-    """
+    """Compute STpuppeteer-emission diagnostics from a written bundle."""
     from pathlib import Path
     import pandas as pd
     from .emission_stpuppeteer.diagnostics import (
@@ -769,29 +756,19 @@ def _write_emission_stpuppeteer_diagnostics(
     from STpuppeteer.simulation import SimulationConfig
 
     bundle = Path(bundle_dir)
-    # The public transcripts.parquet may have renamed cell_id to UNASSIGNED
-    # for ghost-derived molecules; join with molecule_provenance for the
-    # true cell type and leakage flag.
     tx = pd.read_parquet(bundle / "transcripts.parquet")
     prov_path = bundle / "ground_truth" / "molecule_provenance.parquet"
     if prov_path.exists():
         prov = pd.read_parquet(prov_path)
-        # Merge cell type + is_ghost from provenance into the molecule frame.
         if "transcript_id" in tx.columns and "transcript_id" in prov.columns:
-            # bring the columns the diagnostic needs into tx
             keep = [c for c in ("true_cell_type", "true_cell_id", "is_ghost")
                        if c in prov.columns]
             tx = tx.merge(prov[["transcript_id", *keep]],
                               on="transcript_id", how="left")
-    # Rename to the columns the diagnostic expects (cell type, gene).
     if "true_cell_type" in tx.columns and "source_cell_type" not in tx.columns:
         tx = tx.rename(columns={"true_cell_type": "source_cell_type"})
     if "feature_name" in tx.columns and "gene" not in tx.columns:
         tx = tx.rename(columns={"feature_name": "gene"})
-    # is_leaked is NOT in the public transcripts.parquet — molecule_provenance
-    # doesn't carry it either under the current 2.5D writer. If absent we
-    # report leak rate as NaN; not a regression since the value isn't
-    # exposed anywhere downstream.
     if "is_leaked" not in tx.columns:
         tx["is_leaked"] = pd.array([False] * len(tx), dtype="boolean")
 
@@ -800,6 +777,46 @@ def _write_emission_stpuppeteer_diagnostics(
     print_emission_summary(stats)
     out_path = write_emission_diagnostics(tx, cfg, Path(diag_dir))
     print(f"[emission-diag] wrote {out_path}")
+
+
+def _diagnostics_model(args: argparse.Namespace) -> None:
+    """`xesim diagnostics model MODEL_DIR --bundle BUNDLE`."""
+    from pathlib import Path
+    from .diagnostics import fit_model_diagnostics
+    out_dir = Path(args.out) if args.out else Path(args.model) / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[diagnostics model] writing → {out_dir}")
+    written = fit_model_diagnostics(
+        model_dir=args.model, bundle_path=args.bundle, out_dir=out_dir)
+    for p in written:
+        print(f"  {p}")
+
+
+def _diagnostics_explain(args: argparse.Namespace) -> None:
+    """`xesim diagnostics explain SYNTH --bundle BUNDLE --model MODEL`."""
+    from pathlib import Path
+    from .diagnostics import explain_diagnostics
+    out_dir = Path(args.out) if args.out else Path(args.synth) / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[diagnostics explain] writing → {out_dir}")
+    written = explain_diagnostics(
+        bundle_path=args.bundle, synth_dir=args.synth,
+        model_dir=args.model, out_dir=out_dir)
+    for p in written:
+        print(f"  {p}")
+
+
+def _diagnostics_priors(args: argparse.Namespace) -> None:
+    """`xesim diagnostics priors PRIORS_FILE`."""
+    from pathlib import Path
+    from .diagnostics import fit_priors_diagnostics
+    priors_path = Path(args.priors)
+    out_dir = Path(args.out) if args.out else priors_path.parent / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[diagnostics priors] writing → {out_dir}")
+    written = fit_priors_diagnostics(priors_path, out_dir)
+    for p in written:
+        print(f"  {p}")
 
 
 def _inspect_bundle(args: argparse.Namespace) -> None:
@@ -1088,6 +1105,40 @@ def build_parser() -> argparse.ArgumentParser:
     re.add_argument("--seed", type=int, default=0,
                        help="RNG seed (same config + seed → identical output)")
     re.set_defaults(func=_reemit_molecules)
+
+    # diagnostics — emit panels against artifacts that already exist on disk.
+    diag = sub.add_parser(
+        "diagnostics",
+        help="Emit diagnostic plots against existing artifacts (no re-render).")
+    diag_sub = diag.add_subparsers(dest="diag_mode", required=True)
+
+    dm = diag_sub.add_parser(
+        "model",
+        help="Diagnostics for a fitted model dir (training loss, nucleus priors).")
+    dm.add_argument("model", help="path to a fitted MODEL_DIR")
+    dm.add_argument("--bundle", required=True, help="real Xenium bundle the model was fit from")
+    dm.add_argument("--out", default=None,
+                       help="output dir (default: MODEL_DIR/diagnostics/)")
+    dm.set_defaults(func=_diagnostics_model)
+
+    de = diag_sub.add_parser(
+        "explain",
+        help="Diagnostics for a synth bundle vs the real bundle "
+              "(A1-A4 morphology grids, B-D population panels).")
+    de.add_argument("synth", help="path to a synth bundle (xesim explain output)")
+    de.add_argument("--bundle", required=True, help="real Xenium bundle to compare against")
+    de.add_argument("--model", required=True, help="fitted MODEL_DIR used to render the synth bundle")
+    de.add_argument("--out", default=None,
+                       help="output dir (default: SYNTH/diagnostics/)")
+    de.set_defaults(func=_diagnostics_explain)
+
+    dp = diag_sub.add_parser(
+        "priors",
+        help="Diagnostics for a standalone 3D nucleus priors file.")
+    dp.add_argument("priors", help="path to nucleus_priors.json")
+    dp.add_argument("--out", default=None,
+                       help="output dir (default: alongside the priors file)")
+    dp.set_defaults(func=_diagnostics_priors)
 
     # inspect-bundle
     ib = sub.add_parser("inspect-bundle", help="Print summary info for a Xenium bundle")

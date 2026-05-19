@@ -78,19 +78,70 @@ The generative state at the **scene level** is:
 | Tissue architecture | Per-domain type composition, neighbor-conditional type sampling | `priors/tissue_neighborhood.json` |
 | Cell shape | Per-type real-mask exemplars + sectioning state | `exemplars/` from real bundle's polygons |
 | 3D nucleus shape | Per-type log-radius + axis-ratio anisotropy (volume-preserving) | `priors_3d/nucleus_priors.json` |
-| Mechanistic rough | Deterministic per-pixel DAPI / membrane / polyA from per-type efficiencies | `priors/mechanistic_params.json`, `intensity_scatter.json` |
-| Renderer residual | Bounded GAN-augmented VAE that adds high-frequency realism on top of rough | `renderer.pt` (V37bUNet + per-cell `CellEncoder` + PatchGAN) |
+| Structural conditioning | Deterministic per-pixel geometry + type encoding fed to the U-Net (see [Renderer](#renderer)) | `build_structural_channels` (no parameters); optional `per_type_channel_means.npy` for per-stain priors |
+| Trained renderer | GAN-augmented VAE U-Net that paints the four-channel image onto the structural conditioning (see [Renderer](#renderer)) | `renderer.pt` (V37bUNet + per-cell `CellEncoder` + PatchGAN) |
 | Sectioning state | Per-cell "how much of the cell is in this section" prior | `priors/sectioning_states.json` |
 | Transcripts | Per-type NMF factors + Negative-Binomial count priors (assigned + UNASSIGNED tail), via the cellAdmix sister package (run automatically on the bundle, or supply `--celladmix-run PATH`) | `priors/transcripts_nmf.json` |
 
-The renderer is bounded: its raw output is passed through
-`tanh(out) * residual_scale` with `residual_scale ≈ 0.30`, so it can
-only modify the mechanistic rough by a fraction of its dynamic range.
-This is the structural guarantee that the model cannot drift away from
-the cells/types accounted for in the scene.
-
 See [`prior_estimation.md`](prior_estimation.md) for the 3D nucleus
 prior model and fit (with the ellipsoid observation schematic).
+
+## Renderer
+
+The renderer runs in two stages: a deterministic, geometry-only
+encoding of the scene, and a small trained U-Net that turns it into
+stains. The first stage carries the structural guarantee — the
+second can only paint over what the first has marked.
+
+### Stage 1 — structural conditioning (deterministic, no parameters)
+
+`build_structural_channels` (`xesim/structural_refiner.py`) rasters the
+`MechanisticScene` into a stack of per-pixel feature channels. Same
+code path at fit and at inference:
+
+- `cell_mask`, `nucleus_mask`
+- `cell_boundary`, `nucleus_boundary`, `intercellular_edge` (cell
+  pixels neighbouring a *different* cell)
+- distance transforms inside and outside the cell (normalized to
+  ~6 µm) and inside the nucleus (~3 µm)
+- one channel per cell type (`cell_type_{1..T}`, type one-hot)
+- *(optional)* `expected_intensity_{c}` — one channel per stain
+  carrying the per-type mean intensity for the cell underneath. This
+  is the strongest anchor for cell-type-specific stain levels (e.g.
+  aSMA on fibroblasts). Loaded from
+  `canonical/per_type_channel_means.npy`.
+- *(optional)* `stromal_density` — Gaussian-smoothed union of stromal-
+  type cell masks, evaluated *outside* cells. Gives the network a
+  spatial slot for extracellular fibre signal.
+
+The conditioning is the only shape information the U-Net sees. Every
+output pixel is keyed to a cell in the scene by construction.
+
+### Stage 2 — V37b trained renderer (U-Net + per-cell latent)
+
+`V37bUNet` (`xesim/structural_refiner.py`) is a small 3-stage encoder-
+decoder U-Net (hidden=64, GELU, skip connections, bilinear upsampling,
+sigmoid output). Input = the Stage-1 stack concatenated with a per-
+cell latent broadcast over each cell's footprint; output = the four-
+channel image in `[0, 1]`.
+
+Trained as a **VAE + PatchGAN** (`xesim/training/renderer.py`):
+
+- **L1 reconstruction** against the real morphology stack on each
+  training crop.
+- **Per-cell VAE latent.** A small CellEncoder
+  (`xesim/cell_encoder.py`) takes a 48 × 48 crop of each real cell
+  and emits a posterior over a 4-D (default) or 12-D latent. A KL
+  term (weight 0.01) anchors it to N(0, I), so at inference any new
+  cell draws its latent from that prior.
+- **PatchDiscriminator** on the rendered output for local realism
+  gradients.
+
+At inference, `model.render` re-runs Stage 1, samples (or supplies)
+one latent per cell, and forwards one U-Net pass per tile. The latent
+only modulates *how* a cell renders, not *where* — relocation,
+ungrounded emission, and feature invention are impossible because the
+network has no input that would support them.
 
 ## 2D output
 
