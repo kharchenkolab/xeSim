@@ -60,7 +60,7 @@ def canonicalize_bundle(
     include_images: bool = True,
     prefer_parquet: bool = True,
     geometry_source: str = "auto",
-    crop_selection: str = "density",
+    crop_selection: str = "stratified",
     seed: int = 1,
     crop_boxes: list[CropBox] | None = None,
     split_method: str = "spatial_x_quantile",
@@ -73,7 +73,7 @@ def canonicalize_bundle(
     cell_id_col: str = "cell_id",
     stratified_alpha: float = 0.5,
     stratified_k: int = 20,
-    stratified_within_pick: str = "centroid",
+    stratified_within_pick: str = "density",
 ) -> Path:
     """Create canonical crop npz files and a manifest from one Xenium bundle.
 

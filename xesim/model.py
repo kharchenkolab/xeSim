@@ -252,9 +252,9 @@ class XesimModel:
         seed: int = 1,
         with_transcripts: bool = True,
         celladmix_run: str | Path | None = None,
-        crop_selection: str = "density",
+        crop_selection: str = "stratified",
         stratified_alpha: float = 0.5,
-        stratified_within_pick: str = "centroid",
+        stratified_within_pick: str = "density",
         use_per_type_means: bool = True,
     ) -> "XesimModel":
         """Fit a complete model from a Xenium bundle and produce a
@@ -390,22 +390,6 @@ class XesimModel:
         except Exception as e:
             print(f"[fit] 3D nucleus priors skipped: {e}")
 
-        # 5c) build stain-classifier latent bank for the kNN fallback
-        # (4th tier after annotation, transcript-classifier, training
-        # cid_to_type). Catches cells that fall through all earlier
-        # fallbacks. Bank ~10k typed cells × 12-dim latent = ~0.5MB.
-        try:
-            from .stain_classifier import build_latent_bank, save_bank
-            print(f"[fit] stain-classifier latent bank")
-            # Load self-as-model to call encode_real
-            self_model = cls.load(out_dir, device=device)
-            lat, ty, cids = build_latent_bank(self_model, paths.canonical)
-            save_bank(out_dir / "cell_latent_bank.npz", lat, ty, cids)
-            print(f"  bank: {len(lat)} typed cells, "
-                  f"{len(np.unique(ty))} types -> {out_dir}/cell_latent_bank.npz")
-        except Exception as e:
-            print(f"[fit] stain-classifier bank skipped: {e}")
-
         # 6) write manifest — pull renderer-side fields (tile_px,
         # channel_names, n_channels, renderer_variant, recon_weight_mode)
         # from the renderer checkpoint so the model.tile_px / channel_names
@@ -448,6 +432,22 @@ class XesimModel:
         print(f"[fit] model written → {out_dir}  (variant="
                 f"{ckpt_keys.get('renderer_variant', '?')}, fit_timestamp="
                 f"{manifest['fit_timestamp']})")
+
+        # 7) Stain-classifier latent bank — 4th-tier cell-type fallback
+        # (after annotation, transcript-classifier, training cid_to_type).
+        # Must be built AFTER manifest.json exists since `cls.load` reads
+        # it. ~10k typed cells × 12-dim latent = ~0.5MB. The bank is now
+        # mandatory: with the cell_type_resolver refactor (Phase 4), this
+        # is the guarantee that every anchor cell at inference time gets
+        # at least one classifier prediction, so the resolver never has
+        # to leave a cell "unknown".
+        from .stain_classifier import build_latent_bank, save_bank
+        print(f"[fit] stain-classifier latent bank")
+        self_model = cls.load(out_dir, device=device)
+        lat, ty, cids = build_latent_bank(self_model, paths.canonical)
+        save_bank(out_dir / "cell_latent_bank.npz", lat, ty, cids)
+        print(f"  bank: {len(lat)} typed cells, "
+              f"{len(np.unique(ty))} types -> {out_dir}/cell_latent_bank.npz")
         return cls(out_dir, device=device)
 
     # -- Load ------------------------------------------------------------

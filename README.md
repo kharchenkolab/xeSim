@@ -10,10 +10,11 @@ xeSim fits a hybrid physics-based model combined with a neural net renderer for 
 ## Install
 
 ```bash
-# 1. xeSim (this repo) — include the io + analysis extras for full functionality
+# 1. xeSim (this repo). All runtime dependencies are declared — pip
+#    resolves them automatically.
 git clone <this-repo-url> xeSim
 cd xeSim
-pip install -e ".[io,analysis]"
+pip install -e .
 
 # 2. cellAdmix-core (sister package — transcript NMF priors).
 #    Built from C++ via scikit-build-core; needs a working CMake toolchain.

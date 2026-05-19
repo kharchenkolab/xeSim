@@ -59,16 +59,14 @@ If you just want to render morphology (no transcript NMF), pass
 ```bash
 xesim fit-model data/Xenium_pancreas \
     --annotations data/Xenium_pancreas/annotations/annotation.csv.gz \
-    --out pancreas_model/ \
-    --crop-selection stratified --stratified-within-pick density
+    --out pancreas_model/
 ```
 
-`--crop-selection stratified --stratified-within-pick density` selects
-training crops by composition-aware k-medoids (clusters windows by
-cell-type composition, then picks one densely-populated window per
-cluster). This gives the renderer balanced exposure to islets, acini,
-ducts, and stroma — useful on a heterogeneous pancreas section. Drop
-the flags for the simpler density-only default.
+That's the whole command — `stratified` crop selection is the default.
+It clusters bundle windows by cell-type composition (k-medoids) and
+picks the densely-populated representative of each cluster, so the
+renderer sees islets, acini, ducts, and stroma in balanced proportions.
+For a simpler density-only baseline pass `--crop-selection density`.
 
 On a recent GPU (A100): canonicalize ~1 min, train 8000 steps ~17 min.
 The output `pancreas_model/` is self-contained — `manifest.json`,
@@ -169,6 +167,21 @@ pancreas_synth/
 bundles — it preserves the per-cell type, per-cell latent, and
 per-molecule provenance so downstream evaluation can score against
 known truth.
+
+`cells_synth.parquet` carries three extra columns over the public
+`cells.parquet` for cell-type provenance:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `cell_type_source` | string | which tier produced the type call: `annotation`, `transcripts`, `training`, `stain_knn`, `ghost_prior`, or `tx_proposer` |
+| `cell_type_confidence` | float ∈ [0, 1] | tier-comparable confidence (curated tiers ≈ 1.0; classifier tiers carry their per-cell score) |
+| `cell_type_evidence` | string (JSON) | tier-specific evidence blob (e.g. cosine-top + top-5 type scores for transcripts) |
+
+Every anchor cell ends with a real, non-`"unknown"` type by contract —
+the resolver runs the cascade annotation → transcripts → training →
+stain-encoder kNN and the writer asserts zero `"unknown"` rows. Down-
+stream consumers (emission backends, diagnostics) can weight or sample
+by `cell_type_confidence`.
 
 ## 5. Useful next steps
 

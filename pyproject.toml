@@ -12,31 +12,29 @@ authors = [
   { name = "xeSim contributors" }
 ]
 dependencies = [
+  # Core numeric / ML
   "numpy",
   "torch",
-]
-
-[project.optional-dependencies]
-io = [
+  "scipy",
+  "scikit-image",
+  "scikit-learn",
+  "pandas",
+  # Imaging IO (Xenium bundles need all of these)
+  "Pillow",
   "tifffile",
   "imagecodecs",
   "zarr",
   "pyarrow",
+  # Plotting (diagnostics are on by default on `xesim explain`)
+  "matplotlib",
 ]
-analysis = [
-  "scipy",
-  "scikit-image",
-  "pandas",
-]
+
+[project.optional-dependencies]
 test = [
   "pytest",
 ]
 dev = [
   "pytest",
-  "tifffile",
-  "imagecodecs",
-  "zarr",
-  "pyarrow",
 ]
 
 [project.scripts]
