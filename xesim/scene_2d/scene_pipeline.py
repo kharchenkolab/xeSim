@@ -491,8 +491,31 @@ def build_scene(
     # Feather-weighted accumulation: value buffer + weight buffer.
     # At the end, stitched = accum_value / accum_weight.
     feather = _feather_mask(tile_px, overlap_px) if overlap_px > 0 else None
-    accum_value = np.zeros((n_ch, H_total, W_total), dtype=np.float32)
-    accum_weight = np.zeros((H_total, W_total), dtype=np.float32)
+    # The buffers grow with bundle area, not worker count. For breast-5K
+    # (75254×51720×4ch f32 → 58 GB) they overflow RAM even with one
+    # worker. Back them with on-disk memmap so the kernel's page cache
+    # decides what stays resident. The kernel reaps cold pages as memory
+    # pressure rises, so peak RAM stays bounded regardless of bundle size.
+    # Tiles arrive out-of-order with imap_unordered, so accesses are random
+    # — this trades some I/O cost for OOM-free runs. Files are deleted in
+    # the build_scene return-path's _stitch_cleanup() (see below).
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    _stitch_tmpdir = _tempfile.mkdtemp(prefix="xesim_stitch_")
+    if progress:
+        _stitch_gb = (n_ch * H_total * W_total * 4 + H_total * W_total * 4) / (1 << 30)
+        print(f"[build_scene] stitch buffers on disk: {_stitch_tmpdir}  "
+              f"({_stitch_gb:.1f} GB float32 memmap)", flush=True)
+    accum_value = np.memmap(
+        _Path(_stitch_tmpdir) / "accum_value.f32",
+        dtype=np.float32, mode="w+",
+        shape=(n_ch, H_total, W_total),
+    )
+    accum_weight = np.memmap(
+        _Path(_stitch_tmpdir) / "accum_weight.f32",
+        dtype=np.float32, mode="w+",
+        shape=(H_total, W_total),
+    )
     scenes_out: list[Scene2D] = []
     seen_anchor_ids: set[str] = set()    # global anchor-ownership dedupe
     ghost_id_offset = 0
@@ -658,15 +681,21 @@ def build_scene(
             total_ghosts -= ghosts_dropped
             total_mols = sum(int(len(s.molecules)) for s in scenes_out)
 
-    # Feather-weighted normalization. We return the float32 stitched image
-    # directly — calibration to uint16 (if requested) happens at the
-    # bundle-writer boundary, the same as the single-tile `--tile` path.
-    # This unifies all explain paths on a float-output contract and keeps
-    # intermediate buffers free of the per-channel "off"-mode rescale
-    # that destroyed inter-channel ratios.
+    # Feather-weighted normalization, IN PLACE on the memmap to avoid
+    # materialising a second full-plane float32 buffer in RAM. After the
+    # divide, accum_value holds the stitched image and accum_weight is
+    # no longer needed (we keep it on disk until cleanup).
     if progress:
-        print(f"[build_scene] feather-normalize (float32 output)…")
-    stitched = (accum_value / np.maximum(accum_weight[None, :, :], 1e-6)).astype(np.float32)
+        print(f"[build_scene] feather-normalize (float32 output, in-place)…")
+    np.maximum(accum_weight, 1e-6, out=accum_weight)
+    # Per-channel in-place divide keeps the working set bounded by one
+    # channel's worth (~14 GB on breast) rather than 4-channel (~58 GB).
+    for _ci in range(n_ch):
+        np.divide(accum_value[_ci], accum_weight, out=accum_value[_ci])
+    # `accum_value` is now the stitched image. Flush its writeback so the
+    # writer sees a coherent file mapping.
+    accum_value.flush()
+    stitched = accum_value
 
     full_bounds_um = (
         sb[0], sb[1],
@@ -674,9 +703,25 @@ def build_scene(
         sb[1] + H_total * pixel_size,
     )
 
+    # Stitch tmpdir cleanup: the memmap files outlive build_scene, since
+    # write_bundle slices them tile-by-tile. The caller (xesim/cli.py
+    # _explain_multi_path) invokes cleanup_stitch() AFTER write_bundle
+    # returns. Deleting earlier corrupts the writer's reads.
+    def _cleanup_stitch() -> None:
+        import shutil as _shutil
+        try:
+            _shutil.rmtree(_stitch_tmpdir, ignore_errors=True)
+            if progress:
+                print(f"[build_scene] stitch tmp removed: {_stitch_tmpdir}",
+                      flush=True)
+        except Exception as e:
+            if progress:
+                print(f"[build_scene] stitch cleanup error: {e}", flush=True)
+
     return {
         "scenes": scenes_out,
         "stitched_image": stitched,
+        "stitch_cleanup": _cleanup_stitch,
         "scene_bounds_um": full_bounds_um,
         "pixel_size_um": pixel_size,
         "tile_size_um": tile_size_um,

@@ -548,22 +548,32 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
         except Exception as e:
             print(f"[explain] noise calibration unavailable ({e}); skipping noise injection")
     print(f"[explain] Writing bundle → {args.out}")
-    written = write_bundle(
-        output_dir=args.out,
-        scenes=result["scenes"],
-        render_images=result["stitched_image"],
-        channel_names=channel_names_out,
-        pixel_size_um=float(model.pixel_size),
-        gene_panel_source=gp_src,
-        config=config,
-        rng=rng,
-        overwrite=args.overwrite,
-        target_intensity_stats=target_intensity,
-        target_intensity_quantiles=target_quantiles,
-        intensity_mode=calib_mode,
-        real_bundle_path=args.bundle,
-        display_lut=display_lut,
-    )
+    try:
+        written = write_bundle(
+            output_dir=args.out,
+            scenes=result["scenes"],
+            render_images=result["stitched_image"],
+            channel_names=channel_names_out,
+            pixel_size_um=float(model.pixel_size),
+            gene_panel_source=gp_src,
+            config=config,
+            rng=rng,
+            overwrite=args.overwrite,
+            target_intensity_stats=target_intensity,
+            target_intensity_quantiles=target_quantiles,
+            intensity_mode=calib_mode,
+            real_bundle_path=args.bundle,
+            display_lut=display_lut,
+        )
+    finally:
+        # Release the on-disk stitch memmaps (build_scene returned a
+        # tmpdir cleanup callback). Cleanup runs even on writer failure
+        # so we don't leak ~75 GB / run.
+        _cleanup = result.get("stitch_cleanup")
+        if callable(_cleanup):
+            try: _cleanup()
+            except Exception as e:
+                print(f"[explain] stitch cleanup failed: {e}")
     print(f"[explain] Done.")
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
                        indent=2, default=str))
