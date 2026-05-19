@@ -143,21 +143,24 @@ def reemit_molecules(
             "re-emit-molecules never overwrites an existing directory."
         )
 
-    # Step 1: clone bundle. Default is shutil.copytree (full byte-copy);
+    # Step 1: load the source bundle. load_bundle rasterises polygons
+    # into cell_label / nucleus_label on first call and persists them to
+    # SRC/ground_truth/{cell,nucleus}_label.npy so subsequent re-emits
+    # mmap the cache (~1s) instead of re-rasterising (~5-7min). We load
+    # from SRC, not OUT, so the cache benefits every future re-emit on
+    # this bundle, not just runs that happen to write to the same OUT.
+    from .bundle_reader import load_bundle
+    lb = load_bundle(src)
+
+    # Step 2: clone bundle. Default is shutil.copytree (full byte-copy);
     # --use-hard-links uses `cp -al` and unlinks the files we'll rewrite,
     # which avoids the multi-GB copy of morphology.ome.tif. Source bundle
-    # is never touched either way.
+    # is never modified either way (we only added the cache in step 1).
     if use_hard_links:
         logger.info("cloning (hardlinks) %s → %s", src, out)
     else:
         logger.info("copying %s → %s", src, out)
     _clone_bundle(src, out, use_hard_links=use_hard_links)
-
-    # Step 2: load the (just-copied) bundle. The reader rasterises
-    # polygons → cell_label / cell_label_3d, which the emit_* functions
-    # consume directly.
-    from .bundle_reader import load_bundle
-    lb = load_bundle(out)
 
     # Step 3: emit. Dispatch on scene_mode. The emit_* helpers handle
     # config loading, count sampling, leakage, and placement; we just
