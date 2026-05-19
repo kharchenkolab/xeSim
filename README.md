@@ -1,7 +1,7 @@
 # xeSim
 
 
-**Procedural-mechanistic Xenium tissue simulator.**
+**Learning biology through physics-based generative models of Xenium measurements.**
 
 xeSim fits a hybrid physics-based model combined with a neural net renderer for Xenium bundles. The models parameters and scene configuration are optimized to best *explain* the experimentally-observed data: re-rendering the bundle should produce something that looks very similar to the original measurement, but every pixel and molecule in that data is traceable back to its virtual cell source. By constraining the staining and molecular data by the physical model, such simulations aim to provide realistic-looking data where the ground truth is actually known.
 
