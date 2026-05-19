@@ -66,6 +66,9 @@ xesim inspect-model my_model/
 ## Documentation
 
 - [`docs/quickstart.md`](docs/quickstart.md) — installation + first run.
+- [`docs/pancreas_vignette.md`](docs/pancreas_vignette.md) — end-to-end
+  walkthrough on the public Xenium pancreas bundle: download, fit, render
+  a tile, render the whole bundle.
 - [`docs/model.md`](docs/model.md) — what is modeled, pipeline schematic,
   2D / 2.5D outputs, real-vs-rendered examples.
 - [`docs/prior_estimation.md`](docs/prior_estimation.md) — 3D nucleus
