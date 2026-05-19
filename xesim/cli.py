@@ -90,6 +90,7 @@ def _fit_model(args: argparse.Namespace) -> None:
         crop_selection=args.crop_selection,
         stratified_alpha=args.stratified_alpha,
         stratified_within_pick=args.stratified_within_pick,
+        use_per_type_means=args.use_per_type_means,
     )
     # Diagnostics (opt-in via --diagnostic flag).
     if getattr(args, "diagnostic", None) is not None:
@@ -886,28 +887,42 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--out", required=True, help="output MODEL_DIR")
     fit.add_argument("--num-crops", type=int, default=128)
     fit.add_argument("--crop-size-um", type=float, default=64.0)
-    fit.add_argument("--crop-selection", default="density",
+    fit.add_argument("--crop-selection", default="stratified",
                        choices=["density", "spread", "random", "grid",
                                   "stratified"],
-                       help="canonical-crop sampling strategy. density "
-                       "(default): high-cell-density windows, biased toward "
-                       "dense epithelium/islets. spread: uniform across "
-                       "bundle (was v22 default). random/grid: alternatives. "
-                       "stratified: k-means on per-window cell-type "
-                       "composition, per-cluster quota = n_c^alpha (see "
-                       "--stratified-alpha). Needs --annotations.")
+                       help="canonical-crop sampling strategy. stratified "
+                       "(default): k-medoids on per-window cell-type "
+                       "composition with per-cluster quota = n_c^alpha, "
+                       "then within-cluster pick by local density (covers "
+                       "rare types AND common ones; mirrors the WSI "
+                       "foundation-model recipe). density: high-cell-density "
+                       "windows, biased toward dense epithelium/islets. "
+                       "spread: uniform across bundle. random/grid: "
+                       "alternatives. Stratified needs --annotations.")
     fit.add_argument("--stratified-alpha", type=float, default=0.5,
                        help="cluster-size exponent for stratified selection: "
                        "1.0=proportional (≈spread), 0.0=uniform-per-cluster, "
                        "0.5=moderate rare-upsampling (matches WSI foundation-"
                        "model standard practice).")
-    fit.add_argument("--stratified-within-pick", default="centroid",
+    fit.add_argument("--stratified-within-pick", default="density",
                        choices=["centroid", "density"],
                        help="within-cluster pick rule for stratified selection. "
-                       "centroid (default): cluster's compositional medoid (k-medoid-"
-                       "ish). density: cell with highest local density in the "
+                       "density (default): cell with highest local density in the "
                        "cluster, then density × spatial-FPS — gives the renderer "
-                       "info-rich crops while preserving compositional coverage.")
+                       "info-rich crops while preserving compositional coverage. "
+                       "centroid: cluster's compositional medoid (k-medoid-ish; "
+                       "more uniform-by-composition but skips dense epithelium).")
+    fit.add_argument("--use-per-type-means", dest="use_per_type_means",
+                       action="store_true", default=True,
+                       help="add per-cell-type expected per-channel intensity "
+                            "as a renderer conditioning channel (Phase 2.D). "
+                            "Strongest anchor for type-specific stain levels "
+                            "(e.g. CD45 on immune, 18S on exocrine) — default "
+                            "on. Adds n_channels conditioning channels.")
+    fit.add_argument("--no-per-type-means", dest="use_per_type_means",
+                       action="store_false",
+                       help="disable the per-type expected-intensity prior "
+                            "channels (legacy behavior; weaker on rare types).")
     fit.add_argument("--steps", type=int, default=8000,
                        help="renderer training steps")
     fit.add_argument("--seed", type=int, default=1)

@@ -425,8 +425,19 @@ def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
     molecule_provenance.parquet (where the ghost-id is preserved so the
     full noise-source trail is auditable), and they're tagged UNASSIGNED
     in the public transcripts.parquet.
+
+    Type-resolution columns (Phase 3 of the cell_type_resolver refactor):
+      cell_type_source       — which tier produced the type call
+                                (annotation|transcripts|training|stain_knn).
+      cell_type_confidence   — float in [0, 1], tier-comparable.
+      cell_type_evidence     — JSON string with tier-specific evidence.
+
+    These columns live in ground_truth/cells_synth.parquet (xeSim-specific)
+    and are NOT added to the public 10x-format cells.parquet (kept
+    schema-clean for Xenium Explorer / downstream consumers).
     """
     from scipy.ndimage import find_objects as _find_objects
+    from ..cell_type_resolver import evidence_to_json
 
     rows = []
     for sc in scenes:
@@ -451,6 +462,11 @@ def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
             cx_um = xmin + (xs.mean() + x_off) * psz
             cy_um = ymin + (ys.mean() + y_off) * psz
             n_px = int(sub.sum())
+            # Pull resolver-stamped provenance, if present. Cells from a
+            # pre-refactor run (or that fell through all four tiers) get
+            # `None` / 0.0 / "{}" — Phase 4 of the refactor makes the
+            # stain bank mandatory so the None case disappears.
+            res = cell.provenance.get("type_resolution")
             rows.append({
                 "cell_id": cell.cell_id,
                 "cell_type": cell.cell_type or "unknown",
@@ -459,8 +475,32 @@ def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
                 "centroid_y": float(cy_um),
                 "area_um2": float(n_px * psz * psz),
                 "source": cell.source,
+                "cell_type_source": (res["source"] if res else None),
+                "cell_type_confidence": (float(res["confidence"])
+                                            if res else 0.0),
+                "cell_type_evidence": (evidence_to_json(res["evidence"])
+                                          if res else "{}"),
             })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Invariant: every anchor cell must end with a real type. The
+    # cell_type_resolver guarantees this when the stain-classifier bank
+    # exists (mandatory at fit time). If this fires, the model was fit
+    # before the Phase 4 refactor (missing bank) or the resolver had a
+    # bug. Loud failure beats silent dim-rendered "unknown" cells.
+    if len(df) > 0:
+        bad_mask = (df["cell_type"].isin(["unknown", "Unknown", "UNKNOWN", ""])
+                    | df["cell_type"].isna())
+        if bad_mask.any():
+            n_bad = int(bad_mask.sum())
+            sample_ids = df.loc[bad_mask, "cell_id"].head(5).tolist()
+            raise RuntimeError(
+                f"cells_synth invariant violated: {n_bad} of {len(df)} "
+                f"cells have cell_type ∈ {{'', None, 'unknown'}}. The "
+                f"cell-type resolver must produce a real type for every "
+                f"anchor; this typically means the model's stain-classifier "
+                f"bank (cell_latent_bank.npz) is missing or the resolver "
+                f"hit a bug. First offending cell_ids: {sample_ids}.")
+    return df
 
 
 # ---------------------------------------------------------------------------

@@ -47,7 +47,10 @@ class ExplainRegionResult:
 
 
 _ANN_CACHE: dict[str, dict[str, str]] = {}
-_TX_CLASSIFY_CACHE: dict[int, dict[str, str]] = {}
+_TX_CLASSIFY_CACHE: dict[int, dict[str, str]] = {}  # legacy; kept for back-compat
+# Note: the resolver classifier+stain-bank caches now live in
+# xesim.cell_type_resolver._MODEL_TX_CACHE / _STAIN_BANK_CACHE — shared
+# across the 2D + 2.5D entry points.
 
 
 def _transcript_classified_types(model) -> dict[str, str]:
@@ -325,58 +328,34 @@ def explain_region(
     # in scene_io.scene_from_canonical_crop. Also do nucleus-cell remapping
     # so each cell's nucleus uses the cell's label.
     #
-    # Cell-type assignment, in priority order (we want NO untyped cells in
-    # explain output — silent skipping causes per-cell molecule undercount
-    # vs real, AND the renderer collapses to a dim "unknown-type" mode):
-    #   1. Explicit annotation file (cell_id → merged_annotation)
-    #   2. cellAdmix transcript-based classifier (per-cell type from
-    #      cosine similarity to per-type alpha centroids) — covers cells
-    #      that have transcripts but no annotation row
-    #   3. Model's training-time cid_to_type (subset of cells from
-    #      canonical crops)
-    # Future: also a stain-based classifier (encoder-latent kNN on
-    # training cells) — see task #395.
-    cell_id_to_type = _load_annotation(annotation_path) or {}
-    # Augment with transcript-classified types for cells the annotation missed
-    tx_types = _transcript_classified_types(model)
-    if tx_types:
-        # Only fill in missing entries — explicit annotation wins
-        for cid, t in tx_types.items():
-            cell_id_to_type.setdefault(cid, t)
-    # Final fallback: model's cid_to_type from training data
-    if hasattr(model, "cid_to_type"):
-        for cid, idx in model.cid_to_type.items():
-            if cid not in cell_id_to_type and 0 <= idx < len(model.type_names):
-                cell_id_to_type[cid] = model.type_names[idx]
-    # 4th-tier fallback: stain-based encoder-latent kNN (task 9.AA).
-    # Catches anchor cells that fall through annotation, transcript
-    # classifier, and training cid_to_type — typically small / tx-poor.
-    # Only runs if the model has a precomputed latent bank.
-    try:
-        bank_path = Path(model.paths.root) / "cell_latent_bank.npz"
-        nz_check = np.unique(cell_label); nz_check = nz_check[nz_check > 0]
-        # Build list of untyped anchor cells
-        untyped: list[tuple[str, float, float]] = []
-        for i, lbl in enumerate(nz_check):
-            cid = cell_ids[i] if i < len(cell_ids) else None
-            if cid is None or cid in cell_id_to_type:
-                continue
-            # centroid from cell_label mask
-            ys, xs = np.where(cell_label == int(lbl))
-            if ys.size == 0: continue
-            cy_um = float(ys.mean()) * float(model.pixel_size) + float(region_bounds_um[1])
-            cx_um = float(xs.mean()) * float(model.pixel_size) + float(region_bounds_um[0])
-            untyped.append((str(cid), cx_um, cy_um))
-        if bank_path.exists() and untyped:
-            from ..stain_classifier import classify_cells_by_centroid, load_bank
-            bank = load_bank(bank_path)
-            preds = classify_cells_by_centroid(
-                model, bundle_path, untyped, bank=bank)
-            for cid, t in preds.items():
-                if t and t != 'unknown':
-                    cell_id_to_type[cid] = t
-    except Exception as e:
-        print(f"[explain_region] stain-classifier fallback skipped: {e}")
+    # Cell-type resolution flows through the shared
+    # `xesim.cell_type_resolver.resolve_from_model` helper. The cascade is
+    # annotation → transcripts → training → stain_knn; each cell exits
+    # with a TypeResolution (cell_type + source + confidence + evidence)
+    # stamped onto MechanisticCell.provenance['type_resolution'].
+    # 2.5D goes through the same helper from scene_2_5d.scene_first.
+    from ..cell_type_resolver import resolve_from_model
+    anchor_cell_ids = [str(c) for c in cell_ids]
+    # Per-cell centroids in scene-global µm (needed only if stain_knn
+    # fires). cell_ids and the sorted positive labels in cell_label are
+    # aligned by the zarr/polygon loader convention.
+    pos_labels = np.unique(cell_label)
+    pos_labels = pos_labels[pos_labels > 0][:len(anchor_cell_ids)]
+    centroids_um = np.zeros((len(anchor_cell_ids), 2), dtype=np.float32)
+    for i, lbl in enumerate(pos_labels):
+        ys, xs = np.where(cell_label == int(lbl))
+        if ys.size == 0: continue
+        centroids_um[i, 0] = (float(xs.mean()) * float(model.pixel_size)
+                                + float(region_bounds_um[0]))
+        centroids_um[i, 1] = (float(ys.mean()) * float(model.pixel_size)
+                                + float(region_bounds_um[1]))
+    type_resolutions, _unresolved = resolve_from_model(
+        anchor_cell_ids, centroids_um, model, bundle_path,
+        annotation_map=(_load_annotation(annotation_path) or None),
+        progress=False,
+    )
+    # Compat alias for the legacy code below that still uses cell_id_to_type.
+    cell_id_to_type = {cid: r.cell_type for cid, r in type_resolutions.items()}
     nz = np.unique(cell_label); nz = nz[nz > 0]
     nuc_remap = np.zeros_like(cell_label)
     cells: list[MechanisticCell] = []
@@ -464,31 +443,60 @@ def explain_region(
 
         # Determine if this label is an anchor, ghost, or transcript-proposed
         if label_int in ghost_cid_by_label:
+            ghost_type = ghost_type_by_label[label_int]
+            ghost_prov: dict = {"is_ghost": True}
+            # Synthetic ghosts: stamp type_resolution with source=ghost_prior
+            # so the writer pipeline carries the same provenance schema.
+            # Confidence 0.5 — synthetic, not a classifier call.
+            if ghost_type and ghost_type.lower() != "unknown":
+                ghost_prov["type_resolution"] = {
+                    "cell_type": ghost_type, "source": "ghost_prior",
+                    "confidence": 0.5,
+                    "evidence": {"ghost_sampler": True},
+                }
             cells.append(MechanisticCell(
                 cell_id=ghost_cid_by_label[label_int], label=label_int,
                 source="synthetic",
-                cell_type=ghost_type_by_label[label_int],
+                cell_type=ghost_type,
                 nucleus_label=nucleus_label_for_cell,
-                provenance={"is_ghost": True},
+                provenance=ghost_prov,
             ))
         elif label_int in tprop_meta_by_label:
             cid, ctype, prov = tprop_meta_by_label[label_int]
+            tp_prov: dict = {**prov, "is_ghost": False}
+            # Tx-proposer cells: stamp source=tx_proposer with the
+            # cluster's enclosure score as confidence (clamped to [0,1]).
+            if ctype and ctype.lower() != "unknown":
+                cluster_score = float(prov.get("transcripts_proposer", {})
+                                          .get("cluster_n_molecules", 0.0))
+                # cluster_n_molecules is unbounded; map to [0,1] with a
+                # saturating curve so e.g. 20+ molecules → ~0.8.
+                conf = float(min(1.0, max(0.0, cluster_score / 25.0)))
+                tp_prov["type_resolution"] = {
+                    "cell_type": ctype, "source": "tx_proposer",
+                    "confidence": conf,
+                    "evidence": {"cluster_n_molecules": cluster_score},
+                }
             cells.append(MechanisticCell(
                 cell_id=cid, label=label_int,
                 source="tx_inferred",
                 cell_type=ctype,
                 nucleus_label=nucleus_label_for_cell,
-                provenance={**prov, "is_ghost": False},
+                provenance=tp_prov,
             ))
         else:
             cid = (str(cell_id_arr[anchor_idx])
                    if anchor_idx < n_anchor_labels else f"cell_{label_int}")
+            prov: dict = {"is_ghost": False, "source_tag": geom_src}
+            res = type_resolutions.get(cid)
+            if res is not None:
+                prov["type_resolution"] = res.to_dict()
             cells.append(MechanisticCell(
                 cell_id=cid, label=label_int,
                 source="observed_anchor",
                 cell_type=cell_id_to_type.get(cid),
                 nucleus_label=nucleus_label_for_cell,
-                provenance={"is_ghost": False, "source_tag": geom_src},
+                provenance=prov,
             ))
             anchor_idx += 1
 
@@ -511,8 +519,12 @@ def explain_region(
     # gracefully if cellAdmix is unavailable.
     if stamp_transcripts and model.transcripts_priors is not None:
         try:
-            classifications = model.classify_cells_by_transcripts()
-            mech = model.stamp_scene_with_transcripts(mech, classifications)
+            # Reuse the resolver's already-cached classifier output. We
+            # always have transcript_classifications populated above (if
+            # the model has transcript priors). Re-running the classifier
+            # here would burn ~seconds per tile.
+            mech = model.stamp_scene_with_transcripts(
+                mech, transcript_classifications or None)
         except (ImportError, RuntimeError, FileNotFoundError) as e:
             print(f"[explain_region] stamp_transcripts unavailable: {e}")
 

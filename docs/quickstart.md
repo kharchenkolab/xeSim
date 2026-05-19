@@ -13,12 +13,10 @@ xeSim has two pieces: the Python package (this repo) and `cellAdmix-core`
 (a separate C++ / Python build that supplies the transcript NMF priors).
 
 ```bash
-# xeSim — include the [io,analysis] extras for tifffile, pandas, pyarrow,
-# scipy, scikit-image, imagecodecs, zarr. Plain `pip install -e .` only
-# pulls numpy + torch and most features will fail at runtime.
+# xeSim — all runtime dependencies are declared in pyproject.toml.
 git clone <this-repo-url> xeSim
 cd xeSim
-pip install -e ".[io,analysis]"
+pip install -e .
 ```
 
 ```bash
@@ -30,9 +28,6 @@ pip install -e ".[io,analysis]"
 git clone https://github.com/kharchenkolab/cellAdmix-core
 python -m pip install -e cellAdmix-core/python --no-build-isolation
 ```
-
-scikit-learn is required if you plan to use `--crop-selection stratified`
-(installed automatically with `[analysis]`).
 
 A CUDA GPU is required for `fit-model`. Inference (`explain`) works on
 CPU but is much slower.
@@ -62,9 +57,9 @@ Which windows of the bundle anchor the renderer training crops:
 
 | Strategy | What it does |
 |---|---|
-| `density` (default) | high-cell-density windows — biased toward dense epithelium / islets |
+| `stratified` (default) | **k-medoids on per-window cell-type composition + n_c^α quota, then within-cluster pick by local density.** Covers common patterns *and* rare ones (T cells, fibroblasts in tumor-dominated samples). Needs `--annotations`. Tune with `--stratified-alpha` (default 0.5; 1=proportional ≈ spread, 0=uniform-per-cluster). Mirrors the H&E foundation-model recipe (StainStyleSampler 2025, Yottixel). |
+| `density` | high-cell-density windows — biased toward dense epithelium / islets |
 | `spread` | uniform spatial sampling across the bundle |
-| `stratified` | **k-means on per-window cell-type composition + n_c^α quota** — covers common patterns *and* rare ones (T cells, fibroblasts in tumor-dominated samples). Needs `--annotations`. Tune with `--stratified-alpha` (default 0.5; 1=proportional ≈ spread, 0=uniform-per-cluster). Mirrors the H&E foundation-model recipe (StainStyleSampler 2025, Yottixel). |
 | `random`, `grid` | alternatives, mostly for ablations |
 
 The resulting `my_model/` is self-contained:

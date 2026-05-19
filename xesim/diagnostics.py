@@ -256,6 +256,11 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     _add(_safe(_plot_celltype_breakdown, bundle_path, synth_dir, out_dir))
     _add(_safe(_plot_per_cell_distributions, bundle_path, synth_dir, out_dir))
 
+    # T. Cell-type resolution provenance (skipped silently on bundles
+    # written by pre-resolver-refactor xesim that don't have the
+    # cell_type_source column).
+    _add(_safe(_plot_type_resolution_breakdown, bundle_path, synth_dir, out_dir))
+
     # C. Transcript level
     _add(_safe(_plot_per_gene_scatter, bundle_path, synth_dir, out_dir))
 
@@ -953,6 +958,86 @@ def _plot_per_gene_scatter(bundle_path: Path, synth_dir: Path,
 
 # ---------------------------------------------------------------------------
 # D. Intensity
+
+
+def _plot_type_resolution_breakdown(bundle_path: Path, synth_dir: Path,
+                                          out_dir: Path) -> Path | None:
+    """T1: per-cell-type stacked bar of which resolver tier produced the
+    type call. Reveals which cell types lean on which classifiers and
+    where curation gaps are (e.g., a row dominated by stain_knn means
+    that type has weak annotation + transcript coverage).
+    """
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir) / "stats_T1_type_resolution_breakdown.png"
+    cs_path = synth_dir / "ground_truth" / "cells_synth.parquet"
+    if not cs_path.exists():
+        return None
+    gt = pd.read_parquet(cs_path)
+    if "cell_type_source" not in gt.columns:
+        return None    # legacy bundle, no resolver provenance
+
+    # Stacked bar: rows = cell types (sorted by count), stacks = source tier.
+    # Six possible sources; lock the order so panels are comparable across runs.
+    tier_order = ["annotation", "transcripts", "training", "stain_knn",
+                   "ghost_prior", "tx_proposer"]
+    tier_colors = {
+        "annotation":  "#2c7a3b",
+        "transcripts": "#3a6fb0",
+        "training":    "#7c5dd1",
+        "stain_knn":   "#d18a3a",
+        "ghost_prior": "#888888",
+        "tx_proposer": "#bb4477",
+    }
+    # cell-type ordering: by total count, descending. Skip empty rows.
+    type_totals = gt.groupby("cell_type").size().sort_values(ascending=False)
+    types_sorted = [t for t in type_totals.index if type_totals[t] > 0]
+    if not types_sorted:
+        return None
+    pivot = (gt.groupby(["cell_type", "cell_type_source"]).size()
+                  .unstack(fill_value=0)
+                  .reindex(index=types_sorted, columns=tier_order, fill_value=0))
+
+    fig, ax = plt.subplots(figsize=(11, max(3, 0.45 * len(types_sorted) + 1.8)),
+                              facecolor="white")
+    y = np.arange(len(types_sorted))
+    left = np.zeros(len(types_sorted))
+    for tier in tier_order:
+        vals = pivot[tier].to_numpy()
+        if vals.sum() == 0:
+            continue
+        ax.barh(y, vals, left=left, color=tier_colors[tier],
+                  edgecolor="white", linewidth=0.5, label=tier, alpha=0.95)
+        # In-bar labels for tiers contributing ≥5% of that row.
+        for yi, v in enumerate(vals):
+            if v >= 0.05 * type_totals.iloc[yi] and v > 0:
+                ax.text(left[yi] + v/2, yi, f"{int(v)}",
+                          ha="center", va="center", fontsize=7,
+                          color="white", fontweight="bold")
+        left += vals
+    ax.set_yticks(y)
+    ax.set_yticklabels([f"{t[:24]}  (n={int(type_totals[t]):,})"
+                          for t in types_sorted], fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlabel("cells")
+    ax.set_title("T1. Cell-type resolution: per-tier provenance per type",
+                   fontsize=11, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=8, ncol=3, framealpha=0.9)
+    ax.grid(axis="x", alpha=0.25)
+    # Confidence summary line in the figure caption.
+    conf_mean = float(gt["cell_type_confidence"].mean())
+    high_conf_pct = 100.0 * (gt["cell_type_confidence"] >= 0.5).sum() / len(gt)
+    fig.text(0.5, 0.005,
+              f"Mean per-cell confidence: {conf_mean:.2f}.  "
+              f"{high_conf_pct:.1f}% of cells at confidence ≥ 0.5.",
+              ha="center", fontsize=9, style="italic")
+    plt.tight_layout(rect=(0, 0.02, 1, 1))
+    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out
 
 
 def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,

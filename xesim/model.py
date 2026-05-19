@@ -51,7 +51,9 @@ from .canonicalize import canonicalize_bundle
 from .cell_encoder import CROP_SIZE, CellEncoder, extract_cell_crops
 from .cell_shape_exemplar import build_cell_shape_exemplars
 from .cell_types import attach_cell_types
-from .intensity_scatter import calibrate_render_means, fit_intensity_scatter
+from .intensity_scatter import (
+    calibrate_render_means, compute_per_type_channel_means, fit_intensity_scatter,
+)
 from .mechanistic_fit import fit_mechanistic_priors
 from .mechanistic_scene import MechanisticScene
 from .polya_spectrum import fit_polya_spectrum
@@ -250,9 +252,10 @@ class XesimModel:
         seed: int = 1,
         with_transcripts: bool = True,
         celladmix_run: str | Path | None = None,
-        crop_selection: str = "density",
+        crop_selection: str = "stratified",
         stratified_alpha: float = 0.5,
-        stratified_within_pick: str = "centroid",
+        stratified_within_pick: str = "density",
+        use_per_type_means: bool = True,
     ) -> "XesimModel":
         """Fit a complete model from a Xenium bundle and produce a
         self-contained MODEL_DIR. Long-running (~30-60 min).
@@ -324,11 +327,18 @@ class XesimModel:
             _canon_mf = json.load(_f)
         _ch_names = _canon_mf.get("image_channels") or None
         _n_channels = len(_ch_names) if _ch_names else 3
+        if use_per_type_means:
+            ptm_path = paths.canonical / "per_type_channel_means.npy"
+            print(f"[fit] per-type channel means → {ptm_path}")
+            compute_per_type_channel_means(
+                paths.canonical_manifest, paths.cell_types, ptm_path,
+                n_channels=_n_channels)
         print(f"[fit] train renderer ({steps} steps, {_n_channels}-channel: "
-                f"{_ch_names})")
+                f"{_ch_names}, use_per_type_means={use_per_type_means})")
         train_renderer(paths.canonical, paths.renderer, steps=steps,
                           device=device, n_channels=_n_channels,
-                          channel_names=_ch_names)
+                          channel_names=_ch_names,
+                          use_per_type_means=use_per_type_means)
 
         # 5) transcript NMF priors (cellAdmix sister package, default on).
         # Three integration modes:
@@ -380,22 +390,6 @@ class XesimModel:
         except Exception as e:
             print(f"[fit] 3D nucleus priors skipped: {e}")
 
-        # 5c) build stain-classifier latent bank for the kNN fallback
-        # (4th tier after annotation, transcript-classifier, training
-        # cid_to_type). Catches cells that fall through all earlier
-        # fallbacks. Bank ~10k typed cells × 12-dim latent = ~0.5MB.
-        try:
-            from .stain_classifier import build_latent_bank, save_bank
-            print(f"[fit] stain-classifier latent bank")
-            # Load self-as-model to call encode_real
-            self_model = cls.load(out_dir, device=device)
-            lat, ty, cids = build_latent_bank(self_model, paths.canonical)
-            save_bank(out_dir / "cell_latent_bank.npz", lat, ty, cids)
-            print(f"  bank: {len(lat)} typed cells, "
-                  f"{len(np.unique(ty))} types -> {out_dir}/cell_latent_bank.npz")
-        except Exception as e:
-            print(f"[fit] stain-classifier bank skipped: {e}")
-
         # 6) write manifest — pull renderer-side fields (tile_px,
         # channel_names, n_channels, renderer_variant, recon_weight_mode)
         # from the renderer checkpoint so the model.tile_px / channel_names
@@ -438,6 +432,22 @@ class XesimModel:
         print(f"[fit] model written → {out_dir}  (variant="
                 f"{ckpt_keys.get('renderer_variant', '?')}, fit_timestamp="
                 f"{manifest['fit_timestamp']})")
+
+        # 7) Stain-classifier latent bank — 4th-tier cell-type fallback
+        # (after annotation, transcript-classifier, training cid_to_type).
+        # Must be built AFTER manifest.json exists since `cls.load` reads
+        # it. ~10k typed cells × 12-dim latent = ~0.5MB. The bank is now
+        # mandatory: with the cell_type_resolver refactor (Phase 4), this
+        # is the guarantee that every anchor cell at inference time gets
+        # at least one classifier prediction, so the resolver never has
+        # to leave a cell "unknown".
+        from .stain_classifier import build_latent_bank, save_bank
+        print(f"[fit] stain-classifier latent bank")
+        self_model = cls.load(out_dir, device=device)
+        lat, ty, cids = build_latent_bank(self_model, paths.canonical)
+        save_bank(out_dir / "cell_latent_bank.npz", lat, ty, cids)
+        print(f"  bank: {len(lat)} typed cells, "
+              f"{len(np.unique(ty))} types -> {out_dir}/cell_latent_bank.npz")
         return cls(out_dir, device=device)
 
     # -- Load ------------------------------------------------------------

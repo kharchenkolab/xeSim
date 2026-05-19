@@ -31,6 +31,12 @@ class CellRecord:
     t_z: float
     template_xs: np.ndarray      # relative-to-origin
     template_ys: np.ndarray
+    # Optional cell-type-resolver provenance (see xesim.cell_type_resolver).
+    # Stays as a dict (or None) here; the 2.5D bundle writer materialises it
+    # into cell_type_source / cell_type_confidence / cell_type_evidence
+    # columns in ground_truth/cells_synth.parquet. None for legacy code
+    # paths that don't run through explain_region's resolver.
+    type_resolution: dict | None = None
 
 
 def _rasterize_polygon(

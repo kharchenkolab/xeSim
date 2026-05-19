@@ -312,12 +312,18 @@ def write_bundle_25d(
     mol_prov.to_parquet(gt_dir / "molecule_provenance.parquet", index=False)
 
     # 5a. cells_synth.parquet — anchor-cell metadata in the 2D writer's
-    # schema (cell_id, cell_type, is_ghost, centroid_x/y, area_um2, source).
+    # schema (cell_id, cell_type, is_ghost, centroid_x/y, area_um2, source)
+    # PLUS the cell-type-resolver provenance columns (cell_type_source,
+    # cell_type_confidence, cell_type_evidence) plumbed through cells_3d_df
+    # so 2.5D parity with the 2D writer is complete.
     # Excludes unobserved seeds (the 2.5D equivalent of 2D's ghost cells).
-    # Required by explain_diagnostics A4 (cell-level grid) and B5 (celltype
-    # breakdown); the 2D writer emits the same file.
     obs = cells_3d[~cells_3d["is_unobserved"]]
-    cells_synth = pd.DataFrame({
+    # Optional resolver columns — present when the upstream
+    # precompute_scene_25d ran the unified resolver (post-refactor).
+    has_resolver = ("cell_type_source" in obs.columns
+                      and "cell_type_confidence" in obs.columns
+                      and "cell_type_evidence" in obs.columns)
+    cells_synth_dict = {
         "cell_id": obs["cell_id"].astype(str).to_numpy(),
         "cell_type": obs["cell_type"].astype(str).to_numpy(),
         "is_ghost": np.zeros(len(obs), dtype=bool),
@@ -327,7 +333,29 @@ def write_bundle_25d(
             [cell_areas_um2.get(str(c), 0.0) for c in obs["cell_id"]],
             dtype=np.float64),
         "source": np.full(len(obs), "observed_anchor", dtype=object),
-    })
+    }
+    if has_resolver:
+        cells_synth_dict["cell_type_source"] = (
+            obs["cell_type_source"].astype(object).to_numpy())
+        cells_synth_dict["cell_type_confidence"] = (
+            obs["cell_type_confidence"].astype(np.float32).to_numpy())
+        cells_synth_dict["cell_type_evidence"] = (
+            obs["cell_type_evidence"].astype(str).to_numpy())
+    cells_synth = pd.DataFrame(cells_synth_dict)
+    # Invariant: no "unknown" / NaN rows. Mirrors the 2D writer.
+    if len(cells_synth) > 0:
+        bad_mask = (cells_synth["cell_type"]
+                      .isin(["unknown", "Unknown", "UNKNOWN", ""])
+                      | cells_synth["cell_type"].isna())
+        if bad_mask.any():
+            sample_ids = cells_synth.loc[bad_mask, "cell_id"].head(5).tolist()
+            raise RuntimeError(
+                f"cells_synth invariant violated (2.5D): "
+                f"{int(bad_mask.sum())} of {len(cells_synth)} cells have "
+                f"cell_type ∈ {{'', None, 'unknown'}}. The cell-type "
+                f"resolver should produce a real type for every anchor; "
+                f"this typically means the model's stain-classifier bank "
+                f"is missing. Offending cell_ids: {sample_ids}.")
     cells_synth.to_parquet(gt_dir / "cells_synth.parquet", index=False)
     written["ground_truth_dir"] = str(gt_dir)
 
