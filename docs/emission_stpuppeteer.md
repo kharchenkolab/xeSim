@@ -41,19 +41,32 @@ xesim explain /workspace/Xenium_pancreas_membrane_377/data \
     --device cpu --num-workers 1
 ```
 
-**Re-emit on an existing bundle with a different config (~20 seconds):**
+**Re-emit on an existing bundle with a different config:**
 
 ```bash
 xesim re-emit-molecules /tmp/pancreas_stp_25d \
     --out /tmp/pancreas_stp_25d_v2 \
     --stpuppeteer-config tuned_config.yml \
     --seed 1 \
+    --use-hard-links \
     --diagnostic
 ```
 
-`--out` must not exist; the command never overwrites. `--diagnostic`
-writes per-cell-type stats to `<out>/diagnostics/emission_stpuppeteer.json`
-and prints a compact summary to stdout.
+`--out` must not exist; the command never overwrites. `--use-hard-links`
+clones the source bundle with `cp -al` instead of a full byte-copy —
+skips the multi-GB copy of `morphology.ome.tif` and other static files,
+typically cutting clone time from minutes to seconds. Re-emit only
+rewrites the transcripts files, so the source bundle is never touched.
+Off by default; leave off if you may later move the source bundle to a
+different filesystem (hardlinks can't span filesystems).
+
+`--diagnostic` writes per-cell-type stats to
+`<out>/diagnostics/emission_stpuppeteer.json` and prints a compact
+summary to stdout.
+
+> **New to xeSim?** Read the [pancreas vignette](pancreas_vignette.md)
+> first — it walks through the bundle download, model fit, and
+> rendering steps that produce the inputs this page consumes.
 
 ## What you configure is what you get
 
@@ -164,7 +177,8 @@ in new transcripts in seconds:
 
 ```bash
 xesim re-emit-molecules my_explain_out --out new_emission \
-    --stpuppeteer-config tuned_config.yml --seed 1
+    --stpuppeteer-config tuned_config.yml --seed 1 \
+    --use-hard-links
 ```
 
 - `--out` must not already exist (the command never overwrites).
@@ -172,6 +186,17 @@ xesim re-emit-molecules my_explain_out --out new_emission \
   verbatim from the source bundle.
 - Only `transcripts.parquet` and `ground_truth/molecule_provenance.parquet`
   are re-sampled.
+- `--use-hard-links` (off by default) clones the source via `cp -al` so
+  the multi-GB `morphology.ome.tif` is linked, not copied. Re-emit only
+  rewrites transcripts files, so the source bundle is untouched either
+  way. Skip the flag if you may later move the bundle across
+  filesystems (hardlinks can't span them); leave it on for in-place
+  iteration.
+- On a 2D 140k-cell bundle the first re-emit also writes a cached
+  rasterised label image to `ground_truth/cell_label.npy` (+
+  `nucleus_label.npy`). Subsequent re-emits memory-map the cache and
+  skip the polygon raster step — most of the remaining wall-time on
+  warm runs.
 - Same `--diagnostic [DIR]` flag as `explain` — emits the same
   per-cell-type stats JSON.
 
