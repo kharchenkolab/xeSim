@@ -222,22 +222,40 @@ def build_cell_records_2d(
 ) -> list:
     """Build MechanisticCell-shaped records from cells_synth + boundaries.
 
-    The 2D rasteriser (below) assigns the integer label = enumeration order
-    starting at 1, so we mirror that by walking cells_synth in row order.
+    Reads both anchors and ghosts. Anchors come from cell_boundaries.parquet;
+    ghost polygons (when present in the bundle) come from
+    ground_truth/ghost_cell_boundaries.parquet. Each record carries
+    ``provenance['is_ghost']`` so cell_adapter can filter ghosts out at
+    emission time, while the rasteriser below still paints both into
+    cell_label so leak placement sees the same geometry the renderer did.
+
+    The 2D rasteriser assigns label = enumeration order starting at 1, so
+    we mirror that by walking cells_synth in row order.
     """
     cells_synth = _load_cells_synth(bundle_dir)
-    poly_xy = _load_polygons_by_id(bundle_dir / "cell_boundaries.parquet")
+    anchor_polys = _load_polygons_by_id(bundle_dir / "cell_boundaries.parquet")
+    # Ghost polygons live in a separate file (per scene_2d/bundle_writer.py:20);
+    # absent when the original explain ran with --no-ghosts.
+    ghost_path = bundle_dir / "ground_truth" / "ghost_cell_boundaries.parquet"
+    ghost_polys = (_load_polygons_by_id(ghost_path)
+                       if ghost_path.exists() else {})
 
     records: list = []
     for i, row in enumerate(cells_synth.itertuples(index=False), start=1):
         cid = str(row.cell_id)
-        if cid not in poly_xy:
+        is_ghost = bool(getattr(row, "is_ghost", False))
+        # Lookup polygon in the right pool. Skip with a debug note rather
+        # than warn — a bundle generated with --no-ghosts still has rows
+        # in cells_synth flagged is_ghost=True if any tier-2 retyping
+        # left them there, but we don't have geometry to rasterise them.
+        pool = ghost_polys if is_ghost else anchor_polys
+        if cid not in pool:
             continue
         records.append(SimpleNamespace(
             cell_id=cid,
             label=i,                  # integer key into cell_label
             cell_type=str(row.cell_type) if row.cell_type is not None else "",
-            provenance={"is_ghost": bool(getattr(row, "is_ghost", False))},
+            provenance={"is_ghost": is_ghost},
         ))
     return records
 
@@ -249,16 +267,31 @@ def rasterize_2d(
     *,
     use_nuclei: bool = False,
 ) -> np.ndarray:
-    """Rasterise polygons into an (H, W) int32 label array.
+    """Rasterise both anchor and ghost polygons into an (H, W) int32 label array.
 
-    First-write-wins ordering by cell.label so smaller labels = top of stack;
-    in practice 2D anchor cells are Voronoi-disjoint so overlap is rare.
+    Anchors and ghosts share the same int32 image and same label numbering
+    (assigned by build_cell_records_2d in row order). cell_adapter will
+    filter ghosts out at emission time, but their pixels stay in
+    cell_label so per-cell SDF halos can land inside ghost territory and
+    the leak placement matches the rendered morphology.
+
+    First-write-wins by record order; in practice 2D anchor cells are
+    Voronoi-disjoint and ghosts are placed by the original render to
+    potentially overlap anchors. The order of records (anchor-first if
+    cells_synth was written that way) determines who "wins" overlap pixels.
     """
     from skimage.draw import polygon as skpoly
 
-    poly_path = bundle_dir / ("nucleus_boundaries.parquet" if use_nuclei
-                                 else "cell_boundaries.parquet")
-    poly_xy = _load_polygons_by_id(poly_path)
+    if use_nuclei:
+        anchor_polys = _load_polygons_by_id(bundle_dir / "nucleus_boundaries.parquet")
+        ghost_nuc_path = bundle_dir / "ground_truth" / "ghost_nucleus_boundaries.parquet"
+        ghost_polys = (_load_polygons_by_id(ghost_nuc_path)
+                           if ghost_nuc_path.exists() else {})
+    else:
+        anchor_polys = _load_polygons_by_id(bundle_dir / "cell_boundaries.parquet")
+        ghost_path = bundle_dir / "ground_truth" / "ghost_cell_boundaries.parquet"
+        ghost_polys = (_load_polygons_by_id(ghost_path)
+                           if ghost_path.exists() else {})
 
     xmin, ymin, xmax, ymax = meta.tile_bounds_um
     psz = meta.pixel_size_um
@@ -267,9 +300,11 @@ def rasterize_2d(
     label_img = np.zeros((h, w), dtype=np.int32)
 
     for c in records:
-        if c.cell_id not in poly_xy:
+        is_ghost = bool((c.provenance or {}).get("is_ghost", False))
+        pool = ghost_polys if is_ghost else anchor_polys
+        if c.cell_id not in pool:
             continue
-        xy = poly_xy[c.cell_id]
+        xy = pool[c.cell_id]
         # Convert absolute µm vertices → tile-local pixel coords.
         xs_px = (xy[:, 0] - xmin) / psz
         ys_px = (xy[:, 1] - ymin) / psz

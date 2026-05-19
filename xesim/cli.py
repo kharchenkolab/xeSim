@@ -592,6 +592,13 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
                                           model_dir=args.model,
                                           out_dir=diag_dir):
             print(f"  {p}")
+        # STpuppeteer-backend additions: stratified per-cell-type stats
+        # + marker-specificity matrix. Only meaningful when the backend
+        # was actually used; legacy runs have no STpuppeteer cfg to read.
+        if getattr(args, "emission_backend", "legacy") == "stpuppeteer":
+            _write_emission_stpuppeteer_diagnostics(
+                args.out, args.stpuppeteer_config, diag_dir,
+            )
 
 
 def _write_bundle_single(model, args, scene, image, bounds, rng) -> None:
@@ -730,6 +737,69 @@ def _reemit_molecules(args: argparse.Namespace) -> None:
     print(f"[re-emit] done. scene_mode={result.scene_mode} "
           f"n_cells={result.n_cells} n_transcripts={result.n_transcripts:,}")
     print(f"[re-emit] output: {result.out_dir}")
+
+    # --diagnostic [DIR] writes per-cell-type emission stats. Same flag
+    # the rest of the CLI honours; default location is <out>/diagnostics/.
+    if getattr(args, "diagnostic", None) is not None:
+        from .diagnostics import resolve_diagnostic_dir
+        diag_dir = resolve_diagnostic_dir(args.diagnostic, args.out)
+        _write_emission_stpuppeteer_diagnostics(
+            args.out, args.stpuppeteer_config, diag_dir,
+        )
+
+
+def _write_emission_stpuppeteer_diagnostics(
+    bundle_dir: str,
+    stpuppeteer_config: str,
+    diag_dir,
+) -> None:
+    """Compute STpuppeteer-emission diagnostics from a written bundle.
+
+    Reads transcripts.parquet + ground_truth/molecule_provenance.parquet
+    to recover the per-transcript metadata we need (cell type, leakage
+    flag, gene), then loads the config to know which genes are markers
+    for which type. Writes ``emission_stpuppeteer.json`` and prints a
+    compact stdout summary.
+    """
+    from pathlib import Path
+    import pandas as pd
+    from .emission_stpuppeteer.diagnostics import (
+        compute_emission_stats, print_emission_summary, write_emission_diagnostics,
+    )
+    from STpuppeteer.simulation import SimulationConfig
+
+    bundle = Path(bundle_dir)
+    # The public transcripts.parquet may have renamed cell_id to UNASSIGNED
+    # for ghost-derived molecules; join with molecule_provenance for the
+    # true cell type and leakage flag.
+    tx = pd.read_parquet(bundle / "transcripts.parquet")
+    prov_path = bundle / "ground_truth" / "molecule_provenance.parquet"
+    if prov_path.exists():
+        prov = pd.read_parquet(prov_path)
+        # Merge cell type + is_ghost from provenance into the molecule frame.
+        if "transcript_id" in tx.columns and "transcript_id" in prov.columns:
+            # bring the columns the diagnostic needs into tx
+            keep = [c for c in ("true_cell_type", "true_cell_id", "is_ghost")
+                       if c in prov.columns]
+            tx = tx.merge(prov[["transcript_id", *keep]],
+                              on="transcript_id", how="left")
+    # Rename to the columns the diagnostic expects (cell type, gene).
+    if "true_cell_type" in tx.columns and "source_cell_type" not in tx.columns:
+        tx = tx.rename(columns={"true_cell_type": "source_cell_type"})
+    if "feature_name" in tx.columns and "gene" not in tx.columns:
+        tx = tx.rename(columns={"feature_name": "gene"})
+    # is_leaked is NOT in the public transcripts.parquet — molecule_provenance
+    # doesn't carry it either under the current 2.5D writer. If absent we
+    # report leak rate as NaN; not a regression since the value isn't
+    # exposed anywhere downstream.
+    if "is_leaked" not in tx.columns:
+        tx["is_leaked"] = pd.array([False] * len(tx), dtype="boolean")
+
+    cfg = SimulationConfig.from_yaml(stpuppeteer_config)
+    stats = compute_emission_stats(tx, cfg)
+    print_emission_summary(stats)
+    out_path = write_emission_diagnostics(tx, cfg, Path(diag_dir))
+    print(f"[emission-diag] wrote {out_path}")
 
 
 def _inspect_bundle(args: argparse.Namespace) -> None:

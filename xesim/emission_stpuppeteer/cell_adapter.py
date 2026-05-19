@@ -31,6 +31,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_ghost(cell) -> bool:
+    """Return True if the cell is a synthetic ghost (don't emit for it).
+
+    Ghost cells are tagged via ``cell.provenance["is_ghost"] = True`` by
+    xeSim's 2D scene composition. 2.5D bundles have no ghosts.
+    """
+    prov = getattr(cell, "provenance", None) or {}
+    if isinstance(prov, dict):
+        return bool(prov.get("is_ghost", False))
+    return False
+
+
 def _cell_label_value(cell) -> int:
     """Read the integer key used to index cell_label / cell_label_3d.
 
@@ -105,6 +117,35 @@ def build_stpuppeteer_cell_gdf(
     # Materialise scene_cells once so we can iterate twice (for fallback
     # picking, then again to build rows).
     cells = list(scene_cells)
+
+    # ---- Step 0: filter out ghost cells.
+    # Ghost cells exist in the scene to add visual realism to the stain
+    # rendering (out-of-plane / partial-visibility cells). They render
+    # into the morphology image like any other cell, but they don't
+    # represent real-cell biology, so they shouldn't drive STpuppeteer's
+    # per-cell-type emission — otherwise we'd be making up transcript
+    # counts for synthetic cells with no biological identity, which is
+    # exactly what the STpuppeteer backend is meant to avoid.
+    #
+    # Concretely:
+    #   - explain path: ghost cells stay in scene.cells (so the renderer
+    #     paints them); cell_adapter drops them here.
+    #   - re-emit path: bundle_reader loads ghosts from
+    #     ghost_cell_boundaries.parquet so they appear in cell_label
+    #     (leak placement still respects ghost territory); cell_adapter
+    #     drops them here.
+    # In both cases the morphology image is unchanged.
+    n_ghosts_before = sum(
+        1 for c in cells if _is_ghost(c)
+    )
+    cells = [c for c in cells if not _is_ghost(c)]
+    if n_ghosts_before > 0:
+        logger.info(
+            "Skipping %d ghost cell(s) for emission "
+            "(they remain in the rendered stain; STpuppeteer-driven "
+            "emission is anchors-only).",
+            n_ghosts_before,
+        )
 
     # ---- Step 1: pick fallback type ----
     # Tile-local fallback: most common bundle type that's *also* in the config.

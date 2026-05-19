@@ -45,6 +45,9 @@ xesim = "xesim.cli:main"
 [tool.setuptools.packages.find]
 include = ["xesim*"]
 
+[tool.setuptools.package-data]
+"xesim.emission_stpuppeteer" = ["reference_configs/*.yml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

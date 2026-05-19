@@ -503,6 +503,120 @@ def test_cell_label_value_helper():
         _cell_label_value(SimpleNamespace())
 
 
+# ---------------------------------------------------------------------------
+# Ghost-cell behaviour (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_emit_2d_skips_ghosts(synthetic_config_path):
+    """Ghost cells render into the stain image but never emit STpuppeteer
+    transcripts. cell_adapter filters them out before count sampling."""
+    from xesim.emission_stpuppeteer import emit_2d
+
+    # Two cells: one anchor (Epithelial), one ghost (also Epithelial).
+    # If ghosts emitted, the ghost would account for ~half the transcripts.
+    cell_label = np.zeros((40, 40), dtype=np.int32)
+    cell_label[5:15, 5:15] = 1     # anchor
+    cell_label[25:35, 25:35] = 2   # ghost
+    cells = [
+        SimpleNamespace(cell_id="anchor", label=1, cell_type="Epithelial",
+                          provenance={"is_ghost": False}),
+        SimpleNamespace(cell_id="ghost", label=2, cell_type="Epithelial",
+                          provenance={"is_ghost": True}),
+    ]
+    scene = SimpleNamespace(cell_label=cell_label,
+                              nucleus_label=np.zeros_like(cell_label),
+                              cells=cells, pixel_size=0.5)
+    df = emit_2d(scene=scene, stpuppeteer_config=synthetic_config_path,
+                 rng=np.random.default_rng(0), pixel_size_um=0.5)
+
+    # Every emitted transcript is from the anchor; the ghost emitted zero.
+    assert len(df) > 0
+    src_cells = set(df["cell_id"].unique().tolist())
+    assert "anchor" in src_cells
+    assert "ghost" not in src_cells, (
+        f"ghost cell appears as emitter: src cells = {src_cells}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Emission diagnostics (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_emission_diagnostics_compute(synthetic_scene, synthetic_config_path):
+    """compute_emission_stats returns the expected dict shape + values."""
+    from xesim.emission_stpuppeteer import emit_2d
+    from xesim.emission_stpuppeteer.diagnostics import compute_emission_stats
+    from STpuppeteer.simulation import SimulationConfig
+
+    df = emit_2d(scene=synthetic_scene, stpuppeteer_config=synthetic_config_path,
+                 rng=np.random.default_rng(5),
+                 pixel_size_um=synthetic_scene.pixel_size)
+    cfg = SimulationConfig.from_yaml(synthetic_config_path)
+    stats = compute_emission_stats(df, cfg)
+
+    # Top-level shape.
+    assert stats["n_transcripts"] == len(df)
+    assert stats["n_cell_types"] >= 1
+    assert isinstance(stats["per_cell_type"], list)
+    assert isinstance(stats["cross_marker_matrix"], dict)
+
+    # Per-cell-type entries have all the expected fields.
+    for row in stats["per_cell_type"]:
+        for field in ("cell_type", "n_transcripts", "n_cells",
+                      "mean_per_cell", "median_per_cell", "p95_per_cell",
+                      "own_marker_fraction", "leaked_fraction"):
+            assert field in row
+        # Sanity: own-marker fraction in [0, 1].
+        assert 0.0 <= row["own_marker_fraction"] <= 1.0
+        # Cross matrix has a row per cell type.
+        assert row["cell_type"] in stats["cross_marker_matrix"]
+
+
+def test_emission_diagnostics_write_json(synthetic_scene, synthetic_config_path, tmp_path):
+    """write_emission_diagnostics produces a JSON-parseable file."""
+    from xesim.emission_stpuppeteer import emit_2d
+    from xesim.emission_stpuppeteer.diagnostics import write_emission_diagnostics
+    from STpuppeteer.simulation import SimulationConfig
+    import json as _json
+
+    df = emit_2d(scene=synthetic_scene, stpuppeteer_config=synthetic_config_path,
+                 rng=np.random.default_rng(13),
+                 pixel_size_um=synthetic_scene.pixel_size)
+    cfg = SimulationConfig.from_yaml(synthetic_config_path)
+    out_path = write_emission_diagnostics(df, cfg, tmp_path / "diag")
+
+    assert out_path.exists()
+    with open(out_path) as f:
+        loaded = _json.load(f)
+    assert "n_transcripts" in loaded
+    assert "per_cell_type" in loaded
+
+
+# ---------------------------------------------------------------------------
+# Reference configs (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_reference_pancreas_config_loads():
+    """The shipped pancreas reference config loads via SimulationConfig.from_yaml."""
+    from importlib.resources import files
+    from STpuppeteer.simulation import SimulationConfig
+
+    config_path = (files("xesim.emission_stpuppeteer")
+                       / "reference_configs" / "pancreas.yml")
+    cfg = SimulationConfig.from_yaml(str(config_path))
+    # Has the 7 pancreas cell types we documented.
+    expected_types = {
+        "Exocrine epithelial", "Ductal/tumor epithelial", "Fibroblast / CAF",
+        "Immune", "Endothelial", "Mural / pericyte", "Endocrine",
+    }
+    assert set(cfg.cell_type_specs.keys()) == expected_types
+    # Has the configured programs.
+    assert len(cfg.programs) == 7
+
+
 def test_simulationconfig_from_dict_round_trip():
     """SimulationConfig.from_dict accepts both explicit and shorthand styles."""
     from STpuppeteer.simulation import SimulationConfig

@@ -1,0 +1,109 @@
+# Reference STpuppeteer config for the Xenium pancreas (377-gene panel) bundle.
+#
+# Plausible-but-illustrative biology — markers per cell type are drawn from
+# the real gene panel; loadings and activations are hand-picked at sensible
+# values, not fit to the bundle. Tune as you experiment.
+#
+# Schema notes:
+#   - Explicit style: cell_type_specs keyed by bundle annotation names
+#     ("Exocrine epithelial", "Immune", ...). Names MUST match the bundle's
+#     annotation.csv merged_annotation column.
+#   - Gene names referenced in loadings MUST exist in the bundle's gene panel.
+#     The xeSim config_loader hard-errors otherwise.
+#   - leakage_by_celltype values are unrealistically uniform here; vary per
+#     type to study selective contamination effects.
+seed: 42
+expression_baseline: 0.05      # μ₀: background expression floor
+overdispersion_cv: 0.5         # φ₀: NB CV at unit mean expression
+overdispersion_exponent: 0.3   # α: power-law mean–CV slope
+leak_dist_factor: 1.0          # halo extends ~r_eff µm beyond cell boundary
+leakage_by_celltype:
+  Exocrine epithelial: 0.10
+  Ductal/tumor epithelial: 0.10
+  Fibroblast / CAF: 0.10
+  Immune: 0.10
+  Endothelial: 0.10
+  Mural / pericyte: 0.10
+  Endocrine: 0.10
+
+# One program per cell type plus a shared housekeeping-ish program.
+# Loadings are uniform-ish (~10) for simplicity; in real use these would
+# come from differential-expression analysis or be tuned to match
+# observed per-cell-type counts.
+programs:
+  - name: ProgExocrine
+    description: Pancreatic exocrine (acinar) markers
+    loading:
+      AMY2A: 12.0
+      CFTR: 5.0
+  - name: ProgDuctal
+    description: Ductal / tumor epithelial markers
+    loading:
+      EPCAM: 11.0
+      KRT7: 10.0
+      SOX17: 7.0
+      TFF2: 6.0
+  - name: ProgFibroblast
+    description: Stromal / fibroblast / CAF markers
+    loading:
+      SFRP2: 11.0
+      SFRP4: 10.0
+      VCAN: 9.0
+      COL5A2: 8.0
+      PDGFRB: 7.0
+      THBS2: 6.0
+      FBN1: 6.0
+  - name: ProgImmune
+    description: Lymphoid + myeloid immune markers
+    loading:
+      PTPRC: 11.0
+      CD3D: 9.0
+      CD3E: 8.0
+      CD8A: 8.0
+      CD4: 6.0
+      IL7R: 6.0
+      TRAC: 6.0
+      AIF1: 5.0
+      CXCR4: 5.0
+  - name: ProgEndothelial
+    description: Endothelial markers
+    loading:
+      PECAM1: 11.0
+      VWF: 10.0
+      ACKR1: 8.0
+      PROX1: 7.0
+  - name: ProgMural
+    description: Mural / pericyte markers
+    loading:
+      ACTA2: 11.0
+      MYH11: 10.0
+      PDGFRB: 8.0
+      DES: 7.0
+  - name: ProgEndocrine
+    description: Endocrine islet markers (insulin / glucagon / somatostatin)
+    loading:
+      INS: 12.0
+      GCG: 11.0
+      SST: 9.0
+      PPY: 8.0
+      GHRL: 6.0
+      CHGA: 6.0
+
+# Each cell type activates its own primary program at 1.0, no cross-type
+# leakage in the activation matrix. The Dirichlet/anchor drift here is
+# zero (pure round-robin) since we're enumerating types by hand.
+cell_type_specs:
+  Exocrine epithelial:
+    program_activations: {ProgExocrine: 1.0}
+  Ductal/tumor epithelial:
+    program_activations: {ProgDuctal: 1.0}
+  Fibroblast / CAF:
+    program_activations: {ProgFibroblast: 1.0}
+  Immune:
+    program_activations: {ProgImmune: 1.0}
+  Endothelial:
+    program_activations: {ProgEndothelial: 1.0}
+  Mural / pericyte:
+    program_activations: {ProgMural: 1.0}
+  Endocrine:
+    program_activations: {ProgEndocrine: 1.0}
