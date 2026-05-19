@@ -694,6 +694,46 @@ def _generate(args: argparse.Namespace) -> None:
     print(f"Wrote {len(paths)} scene(s) → {out_dir}")
 
 
+def _diagnostics_model(args: argparse.Namespace) -> None:
+    """`xesim diagnostics model MODEL_DIR --bundle BUNDLE`."""
+    from pathlib import Path
+    from .diagnostics import fit_model_diagnostics
+    out_dir = Path(args.out) if args.out else Path(args.model) / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[diagnostics model] writing → {out_dir}")
+    written = fit_model_diagnostics(
+        model_dir=args.model, bundle_path=args.bundle, out_dir=out_dir)
+    for p in written:
+        print(f"  {p}")
+
+
+def _diagnostics_explain(args: argparse.Namespace) -> None:
+    """`xesim diagnostics explain SYNTH --bundle BUNDLE --model MODEL`."""
+    from pathlib import Path
+    from .diagnostics import explain_diagnostics
+    out_dir = Path(args.out) if args.out else Path(args.synth) / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[diagnostics explain] writing → {out_dir}")
+    written = explain_diagnostics(
+        bundle_path=args.bundle, synth_dir=args.synth,
+        model_dir=args.model, out_dir=out_dir)
+    for p in written:
+        print(f"  {p}")
+
+
+def _diagnostics_priors(args: argparse.Namespace) -> None:
+    """`xesim diagnostics priors PRIORS_FILE`."""
+    from pathlib import Path
+    from .diagnostics import fit_priors_diagnostics
+    priors_path = Path(args.priors)
+    out_dir = Path(args.out) if args.out else priors_path.parent / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[diagnostics priors] writing → {out_dir}")
+    written = fit_priors_diagnostics(priors_path, out_dir)
+    for p in written:
+        print(f"  {p}")
+
+
 def _inspect_bundle(args: argparse.Namespace) -> None:
     info = inspect_bundle(args.bundle)
     print(json.dumps(info, indent=2, default=str))
@@ -951,6 +991,42 @@ def build_parser() -> argparse.ArgumentParser:
                        help="crop_id within --guide-bundle to use as guide")
     gen.add_argument("--device", default=None)
     gen.set_defaults(func=_generate)
+
+    # diagnostics — emit panels against artifacts that already exist on
+    # disk (no fit, no re-render). Three modes mirror the three places
+    # diagnostics get auto-generated today.
+    diag = sub.add_parser(
+        "diagnostics",
+        help="Emit diagnostic plots against existing artifacts (no re-render).")
+    diag_sub = diag.add_subparsers(dest="diag_mode", required=True)
+
+    dm = diag_sub.add_parser(
+        "model",
+        help="Diagnostics for a fitted model dir (training loss, nucleus priors).")
+    dm.add_argument("model", help="path to a fitted MODEL_DIR")
+    dm.add_argument("--bundle", required=True, help="real Xenium bundle the model was fit from")
+    dm.add_argument("--out", default=None,
+                       help="output dir (default: MODEL_DIR/diagnostics/)")
+    dm.set_defaults(func=_diagnostics_model)
+
+    de = diag_sub.add_parser(
+        "explain",
+        help="Diagnostics for a synth bundle vs the real bundle "
+              "(A1-A4 morphology grids, B-D population panels).")
+    de.add_argument("synth", help="path to a synth bundle (xesim explain output)")
+    de.add_argument("--bundle", required=True, help="real Xenium bundle to compare against")
+    de.add_argument("--model", required=True, help="fitted MODEL_DIR used to render the synth bundle")
+    de.add_argument("--out", default=None,
+                       help="output dir (default: SYNTH/diagnostics/)")
+    de.set_defaults(func=_diagnostics_explain)
+
+    dp = diag_sub.add_parser(
+        "priors",
+        help="Diagnostics for a standalone 3D nucleus priors file.")
+    dp.add_argument("priors", help="path to nucleus_priors.json")
+    dp.add_argument("--out", default=None,
+                       help="output dir (default: alongside the priors file)")
+    dp.set_defaults(func=_diagnostics_priors)
 
     # inspect-bundle
     ib = sub.add_parser("inspect-bundle", help="Print summary info for a Xenium bundle")

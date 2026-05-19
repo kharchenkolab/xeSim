@@ -183,7 +183,16 @@ known truth.
 - **Diagnostics on whole-bundle output**: drop `--no-diagnostic` to
   get the standard real-vs-synth comparison panels in
   `pancreas_synth/diagnostics/` — multi-scale grids that anchor to
-  real bundle picks and show per-cell-type fidelity.
+  real bundle picks and show per-cell-type fidelity. To emit
+  diagnostics **against an existing synth bundle** (no re-render):
+  ```bash
+  xesim diagnostics explain pancreas_synth/ \
+      --bundle data/Xenium_pancreas \
+      --model pancreas_model/
+  ```
+  Takes ~5 min on the pancreas bundle. `xesim diagnostics model` and
+  `xesim diagnostics priors` cover the fit-time diagnostics
+  equivalently.
 - **Augmentations**: `--add-transcript-proposed` recovers cells from
   orphan transcript clusters; `--stamp-transcripts` writes cellAdmix
   type calls onto every transcript. Both require the model to have
