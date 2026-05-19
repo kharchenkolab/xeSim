@@ -9,12 +9,49 @@ the simulator produces exactly that. Use it when you want predictable,
 controllable emission for benchmarking downstream tools, sweeping
 parameters, or studying selective contamination effects.
 
+## Quick-start: pancreas (377-gene panel)
+
+These examples use the included pancreas reference config and the
+`xesim_v21_model` fitted model. Adjust paths to your local setup.
+
+**Single-tile 2D explain (~1 minute):**
+
 ```bash
-xesim explain BUNDLE --model MODEL_DIR --out OUT \
+xesim explain /workspace/Xenium_pancreas_membrane_377/data \
+    --model /workspace/xeSim/tmp/xesim_v21_model \
+    --out /tmp/pancreas_stp_tile \
+    --tile 2000,1500 \
     --emission-backend stpuppeteer \
     --stpuppeteer-config xesim/emission_stpuppeteer/reference_configs/pancreas.yml \
-    --tile 2000,1500
+    --device cpu
 ```
+
+**300 × 300 µm 2.5D region (~4 minutes on CPU):**
+
+```bash
+xesim explain /workspace/Xenium_pancreas_membrane_377/data \
+    --model /workspace/xeSim/tmp/xesim_v21_model \
+    --out /tmp/pancreas_stp_25d \
+    --region 1850,1350,2150,1650 \
+    --scene-mode 2.5d \
+    --emission-backend stpuppeteer \
+    --stpuppeteer-config xesim/emission_stpuppeteer/reference_configs/pancreas.yml \
+    --device cpu --num-workers 1
+```
+
+**Re-emit on an existing bundle with a different config (~20 seconds):**
+
+```bash
+xesim re-emit-molecules /tmp/pancreas_stp_25d \
+    --out /tmp/pancreas_stp_25d_v2 \
+    --stpuppeteer-config tuned_config.yml \
+    --seed 1 \
+    --diagnostic
+```
+
+`--out` must not exist; the command never overwrites. `--diagnostic`
+writes per-cell-type stats to `<out>/diagnostics/emission_stpuppeteer.json`
+and prints a compact summary to stdout.
 
 ## What you configure is what you get
 
