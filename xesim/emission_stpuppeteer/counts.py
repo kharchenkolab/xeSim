@@ -1,7 +1,7 @@
 """Geometry-free emission decisions: counts + per-transcript leakage.
 
 This module produces a long-format DataFrame of per-transcript decisions
-— ``(transcript_id, cell_id, gene, is_leaked, compartment)`` — with NO
+— ``(cell_id, feature_name, is_leaked, compartment)`` — with NO
 spatial coordinates. Placement happens later (see ``placement_2d`` /
 ``placement_3d``). All work here is dimension-agnostic.
 
@@ -52,16 +52,16 @@ def emit_decisions(
     pd.DataFrame
         Long transcript table. Columns:
 
-        - ``transcript_id`` (str)
         - ``cell_id`` (str) — source cell
-        - ``feature_name`` (str) — gene name (STpuppeteer's column name; the
-          xeSim bundle writer renames to ``gene`` / ``feature_name`` at output)
+        - ``feature_name`` (str) — gene name
         - ``is_leaked`` (bool)
         - ``compartment`` (str) — placeholder "cyto" in Phase 1
+
+        No ``transcript_id`` column — xeSim's bundle writer / reemit
+        assigns its own uint64 IDs at output time.
     """
     from STpuppeteer.simulation import (
         sample_counts_program_model,
-        counts_to_transcript_df,
         classify_leakage,
     )
 
@@ -69,7 +69,7 @@ def emit_decisions(
         # No emittable cells (e.g., tile had no cells with configured types).
         # Returning an empty frame keeps the caller's downstream code simple.
         return pd.DataFrame({
-            "transcript_id": [], "cell_id": [], "feature_name": [],
+            "cell_id": [], "feature_name": [],
             "is_leaked": [], "compartment": [],
         })
 
@@ -78,15 +78,28 @@ def emit_decisions(
     # (n_cells × n_genes) array.
     count_array = sample_counts_program_model(cell_gdf, cfg, rng)
 
-    # Step 2: expand counts to long format.
+    # Step 2: expand the dense count matrix to a long per-transcript frame.
+    # Inlined np.nonzero + np.repeat rather than calling
+    # counts_to_transcript_df — the helper additionally synthesizes
+    # f"tr_{i}" Python-string transcript IDs that no xeSim consumer reads
+    # (bundle writer / reemit assign their own uint64 IDs at output time),
+    # which adds ~2s + ~200MB at 6M-transcript scale.
     gene_names = cfg.resolve_gene_names()
-    trs_df = counts_to_transcript_df(
-        count_array, cell_gdf["cell_id"].values, gene_names
-    )
-    if len(trs_df) == 0:
-        trs_df["is_leaked"] = pd.array([], dtype="boolean")
-        trs_df["compartment"] = pd.array([], dtype="object")
-        return trs_df
+    counts_arr = np.asarray(count_array)
+    ci, gi = np.nonzero(counts_arr)
+    cv = counts_arr[ci, gi].astype(int)
+    if cv.sum() == 0:
+        return pd.DataFrame({
+            "cell_id": pd.array([], dtype=object),
+            "feature_name": pd.array([], dtype=object),
+            "is_leaked": pd.array([], dtype="boolean"),
+            "compartment": pd.array([], dtype=object),
+        })
+    pair = np.repeat(np.arange(len(cv)), cv)
+    trs_df = pd.DataFrame({
+        "cell_id": np.asarray(cell_gdf["cell_id"].values)[ci[pair]],
+        "feature_name": np.asarray(gene_names)[gi[pair]],
+    })
 
     # Step 3: per-transcript Bernoulli leakage. classify_leakage only reads
     # gpar_df["gene_leakage"]; build a minimal 2-column frame from
