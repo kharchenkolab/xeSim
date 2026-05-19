@@ -90,6 +90,7 @@ def _fit_model(args: argparse.Namespace) -> None:
         crop_selection=args.crop_selection,
         stratified_alpha=args.stratified_alpha,
         stratified_within_pick=args.stratified_within_pick,
+        use_per_type_means=args.use_per_type_means,
     )
     # Diagnostics (opt-in via --diagnostic flag).
     if getattr(args, "diagnostic", None) is not None:
@@ -812,6 +813,17 @@ def build_parser() -> argparse.ArgumentParser:
                        "ish). density: cell with highest local density in the "
                        "cluster, then density × spatial-FPS — gives the renderer "
                        "info-rich crops while preserving compositional coverage.")
+    fit.add_argument("--use-per-type-means", dest="use_per_type_means",
+                       action="store_true", default=True,
+                       help="add per-cell-type expected per-channel intensity "
+                            "as a renderer conditioning channel (Phase 2.D). "
+                            "Strongest anchor for type-specific stain levels "
+                            "(e.g. CD45 on immune, 18S on exocrine) — default "
+                            "on. Adds n_channels conditioning channels.")
+    fit.add_argument("--no-per-type-means", dest="use_per_type_means",
+                       action="store_false",
+                       help="disable the per-type expected-intensity prior "
+                            "channels (legacy behavior; weaker on rare types).")
     fit.add_argument("--steps", type=int, default=8000,
                        help="renderer training steps")
     fit.add_argument("--seed", type=int, default=1)

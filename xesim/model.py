@@ -51,7 +51,9 @@ from .canonicalize import canonicalize_bundle
 from .cell_encoder import CROP_SIZE, CellEncoder, extract_cell_crops
 from .cell_shape_exemplar import build_cell_shape_exemplars
 from .cell_types import attach_cell_types
-from .intensity_scatter import calibrate_render_means, fit_intensity_scatter
+from .intensity_scatter import (
+    calibrate_render_means, compute_per_type_channel_means, fit_intensity_scatter,
+)
 from .mechanistic_fit import fit_mechanistic_priors
 from .mechanistic_scene import MechanisticScene
 from .polya_spectrum import fit_polya_spectrum
@@ -253,6 +255,7 @@ class XesimModel:
         crop_selection: str = "density",
         stratified_alpha: float = 0.5,
         stratified_within_pick: str = "centroid",
+        use_per_type_means: bool = True,
     ) -> "XesimModel":
         """Fit a complete model from a Xenium bundle and produce a
         self-contained MODEL_DIR. Long-running (~30-60 min).
@@ -324,11 +327,18 @@ class XesimModel:
             _canon_mf = json.load(_f)
         _ch_names = _canon_mf.get("image_channels") or None
         _n_channels = len(_ch_names) if _ch_names else 3
+        if use_per_type_means:
+            ptm_path = paths.canonical / "per_type_channel_means.npy"
+            print(f"[fit] per-type channel means → {ptm_path}")
+            compute_per_type_channel_means(
+                paths.canonical_manifest, paths.cell_types, ptm_path,
+                n_channels=_n_channels)
         print(f"[fit] train renderer ({steps} steps, {_n_channels}-channel: "
-                f"{_ch_names})")
+                f"{_ch_names}, use_per_type_means={use_per_type_means})")
         train_renderer(paths.canonical, paths.renderer, steps=steps,
                           device=device, n_channels=_n_channels,
-                          channel_names=_ch_names)
+                          channel_names=_ch_names,
+                          use_per_type_means=use_per_type_means)
 
         # 5) transcript NMF priors (cellAdmix sister package, default on).
         # Three integration modes:
