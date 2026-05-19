@@ -240,6 +240,169 @@ def assert_all_resolved(
             f"{missing[:5]}")
 
 
+def resolve_from_model(
+    cell_ids: list[str],
+    centroids_um: "np.ndarray | None",
+    model,
+    bundle_path: str | "Path",
+    *,
+    annotation_map: dict[str, str] | None = None,
+    annotation_path: str | "Path | None" = None,
+    progress: bool = True,
+) -> tuple[dict[str, TypeResolution], list[str]]:
+    """Single entry point: turn a fitted model + Xenium bundle into a
+    resolved cell-type dict for ``cell_ids``.
+
+    This is the shared cascade implementation that the 2D
+    (``explain_region``) and 2.5D (``scene_2_5d.scene_first``) pipelines
+    both invoke. It owns:
+
+      - tier-1 annotation table loading (from ``annotation_path``,
+        the model's bundled annotation copy, or the explicit
+        ``annotation_map`` the caller passed in),
+      - tier-2 cellAdmix transcript classifier invocation (with a
+        process-wide cache keyed by ``id(model)``),
+      - tier-3 model.cid_to_type lookup,
+      - tier-4 stain-classifier kNN — run ONLY for the cells that
+        fell through tiers 1-3, since encoding is the expensive step,
+      - the final cascade via :func:`resolve_cell_types`.
+
+    Parameters
+    ----------
+    cell_ids
+        Anchor cell ids in the order they should appear in the output.
+    centroids_um
+        Optional ``(N, 2)`` array of cell centroids in µm. Required only
+        if stain_knn will need to encode some cells (i.e. the bank
+        exists AND some cells fall through tiers 1-3). Pass ``None`` to
+        skip tier-4 entirely.
+    model
+        Fitted ``XesimModel``; supplies the transcripts classifier,
+        ``cid_to_type``, ``type_names``, and the model dir (used to
+        locate ``cell_latent_bank.npz``).
+    bundle_path
+        Path to the source Xenium bundle (stain_knn reads crops from
+        it).
+    annotation_map
+        Pre-loaded ``cell_id → type_name`` map. If provided, takes
+        precedence over the CSV at ``annotation_path``.
+    annotation_path
+        Path to a ``cell_id, merged_annotation`` CSV. Falls back to
+        ``MODEL_DIR/annotations/annotation.csv.gz`` when not given.
+    progress
+        Whether to print a one-line per-tier summary after resolution.
+
+    Returns
+    -------
+    (resolutions, unresolved)
+        Same shape as :func:`resolve_cell_types`. Use
+        :func:`assert_all_resolved` to enforce zero-unknowns at the
+        caller boundary.
+    """
+    from pathlib import Path as _Path
+    import numpy as _np
+
+    # ---- Tier 1: annotation map ---------------------------------------
+    if annotation_map is None:
+        annotation_map = {}
+        if annotation_path is None and hasattr(model, "paths"):
+            cand = _Path(model.paths.root) / "annotations" / "annotation.csv.gz"
+            if cand.exists():
+                annotation_path = cand
+        if annotation_path is not None and _Path(annotation_path).exists():
+            try:
+                import pandas as _pd
+                ann_df = _pd.read_csv(annotation_path, compression="infer")
+                if {"cell_id", "merged_annotation"}.issubset(ann_df.columns):
+                    annotation_map = dict(zip(
+                        ann_df["cell_id"].astype(str),
+                        ann_df["merged_annotation"].astype(str)))
+            except Exception:
+                pass
+
+    # ---- Tier 2: cellAdmix classifier, with process-wide cache --------
+    transcript_classifications: dict[str, dict] = {}
+    if getattr(model, "transcripts_priors", None) is not None:
+        cache_key = id(model)
+        cached = _MODEL_TX_CACHE.get(cache_key)
+        if cached is not None:
+            transcript_classifications = cached
+        else:
+            try:
+                transcript_classifications = model.classify_cells_by_transcripts()
+                _MODEL_TX_CACHE[cache_key] = transcript_classifications
+            except Exception as e:
+                if progress:
+                    print(f"[resolve_from_model] cellAdmix unavailable: {e}")
+                _MODEL_TX_CACHE[cache_key] = {}
+
+    # ---- Tier 3: training cid_to_type ---------------------------------
+    training_map: dict[str, int] = {}
+    training_type_names: list[str] = []
+    if hasattr(model, "cid_to_type"):
+        training_map = {str(k): int(v) for k, v in model.cid_to_type.items()}
+        training_type_names = list(model.type_names)
+
+    # Pre-resolve with tiers 1-3 to find the (small) set that needs
+    # the expensive tier-4 encoder pass.
+    _pre, unresolved_pre = resolve_cell_types(
+        cell_ids,
+        annotation_map=annotation_map,
+        transcript_classifications=transcript_classifications,
+        training_map=training_map,
+        training_type_names=training_type_names,
+    )
+
+    # ---- Tier 4: stain kNN on the leftovers ---------------------------
+    stain_predictions: dict[str, str] = {}
+    if unresolved_pre and centroids_um is not None and hasattr(model, "paths"):
+        bank_path = _Path(model.paths.root) / "cell_latent_bank.npz"
+        if bank_path.exists():
+            id_to_xy = {cid: (float(centroids_um[i, 0]), float(centroids_um[i, 1]))
+                        for i, cid in enumerate(cell_ids)
+                        if i < len(centroids_um)}
+            triples = [(cid, *id_to_xy[cid]) for cid in unresolved_pre
+                       if cid in id_to_xy]
+            if triples:
+                try:
+                    from .stain_classifier import (
+                        classify_cells_by_centroid, load_bank)
+                    bk_key = str(bank_path.resolve())
+                    bank = _STAIN_BANK_CACHE.get(bk_key)
+                    if bank is None:
+                        bank = load_bank(bank_path)
+                        _STAIN_BANK_CACHE[bk_key] = bank
+                    stain_predictions = classify_cells_by_centroid(
+                        model, bundle_path, triples, bank=bank)
+                except Exception as e:
+                    if progress:
+                        print(f"[resolve_from_model] stain_knn skipped: {e}")
+
+    resolutions, unresolved = resolve_cell_types(
+        cell_ids,
+        annotation_map=annotation_map,
+        transcript_classifications=transcript_classifications,
+        training_map=training_map,
+        training_type_names=training_type_names,
+        stain_predictions=stain_predictions,
+    )
+
+    if progress and resolutions:
+        from collections import Counter as _Counter
+        ctr = _Counter(r.source for r in resolutions.values())
+        print(f"[resolve_from_model] {len(cell_ids)} cells; per tier: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(ctr.items()))
+              + (f"; UNRESOLVED={len(unresolved)}" if unresolved else ""))
+    return resolutions, unresolved
+
+
+# Process-wide caches used by `resolve_from_model`. cellAdmix
+# classifier output is keyed by id(model); stain banks by absolute path.
+# Lifting these from `explain_region` so both 2D and 2.5D share them.
+_MODEL_TX_CACHE: dict[int, dict[str, dict]] = {}
+_STAIN_BANK_CACHE: dict[str, tuple] = {}
+
+
 def tier_counts(resolutions: dict[str, TypeResolution]) -> dict[str, int]:
     """Aggregate per-source counts — useful for diagnostics + summary stats."""
     from collections import Counter

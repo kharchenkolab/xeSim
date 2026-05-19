@@ -102,9 +102,14 @@ def precompute_scene_25d(
     obs["z_extent_um"] = obs["z_extent_um"].fillna(15.0)
     if progress: print(f"[scene_first] {len(obs)} observed cells")
 
-    # Tier-2..4 retyping for cells the templates_bank left as 'unknown'.
-    from .typing_fallback import retype_unknown_observed_cells
-    obs = retype_unknown_observed_cells(obs, model, bundle_path, progress=progress)
+    # Unified cell-type resolution (same cascade as the 2D explain path).
+    # Every observed cell ends with a TypeResolution (source/confidence/
+    # evidence), stamped onto its CellRecord below so the writer can
+    # populate ground_truth/cells_synth.parquet's resolver columns.
+    from .typing_fallback import resolve_observed_cell_types
+    obs, _obs_type_resolutions = resolve_observed_cell_types(
+        obs, model, bundle_path,
+        annotation_path=annotation_path, progress=progress)
 
     # 2. Unobserved seeds over the full scene
     unobs_seeds = []
@@ -157,6 +162,17 @@ def precompute_scene_25d(
                 [list(s.xy_seed) for s in unobs_seeds]
     all_cells: list[CellRecord] = []
     for i, (tlt, row) in enumerate(zip(tilts, all_rows.itertuples(index=False))):
+        # Type-resolver provenance: observed anchors get the cascade
+        # result; unobserved seeds are synthetic ("__unobs_…") and stamp
+        # source='ghost_prior' with confidence 0.5 (parity with 2D).
+        cid = str(tlt.cell_id)
+        if cid.startswith("__unobs_"):
+            tr = {"cell_type": tlt.cell_type, "source": "ghost_prior",
+                  "confidence": 0.5,
+                  "evidence": {"unobserved_seed": True}}
+        else:
+            res = _obs_type_resolutions.get(cid)
+            tr = res.to_dict() if res is not None else None
         all_cells.append(CellRecord(
             cell_idx=i + 1,
             cell_id=tlt.cell_id, cell_type=tlt.cell_type,
@@ -166,6 +182,7 @@ def precompute_scene_25d(
             t_x=tlt.t_x, t_y=tlt.t_y, t_z=tlt.t_z,
             template_xs=np.asarray(row.vertex_x_rel, dtype=np.float32),
             template_ys=np.asarray(row.vertex_y_rel, dtype=np.float32),
+            type_resolution=tr,
         ))
 
     # 6. Nucleus polygons per cell
@@ -247,6 +264,7 @@ def render_tile_from_shared(
             xy_seed=c.xy_seed, z_center=c.z_center, z_extent=c.z_extent,
             t_x=c.t_x, t_y=c.t_y, t_z=c.t_z,
             template_xs=c.template_xs, template_ys=c.template_ys,
+            type_resolution=c.type_resolution,
         )
         local_cells.append(new_c)
         cell_id_to_local_idx[c.cell_id] = local_idx
@@ -346,15 +364,19 @@ def render_tile_from_shared(
 
     # 8. cells_3d table — only the cells we OWN (centroid strictly in tile);
     # the stitcher will dedupe across tiles
+    from ..cell_type_resolver import evidence_to_json
     cells_3d_cols = ["cell_id", "cell_idx", "cell_type",
                        "centroid_x", "centroid_y", "z_center_um", "z_extent_um",
-                       "t_x", "t_y", "t_z", "is_unobserved"]
+                       "t_x", "t_y", "t_z", "is_unobserved",
+                       "cell_type_source", "cell_type_confidence",
+                       "cell_type_evidence"]
     rows = []
     for c in local_cells:
         if c.cell_id in owned_local_ids or c.cell_id.startswith("__unobs_"):
             # Owned observed OR unobserved that landed in this tile's owner region
             cx, cy = c.xy_seed
             if xmin <= cx < xmax and ymin <= cy < ymax:
+                tr = c.type_resolution
                 rows.append({
                     "cell_id": c.cell_id, "cell_idx": c.cell_idx,
                     "cell_type": c.cell_type,
@@ -362,6 +384,11 @@ def render_tile_from_shared(
                     "z_center_um": c.z_center, "z_extent_um": c.z_extent,
                     "t_x": c.t_x, "t_y": c.t_y, "t_z": c.t_z,
                     "is_unobserved": c.cell_id.startswith("__unobs_"),
+                    "cell_type_source": (tr["source"] if tr else None),
+                    "cell_type_confidence": (float(tr["confidence"])
+                                                if tr else 0.0),
+                    "cell_type_evidence": (evidence_to_json(tr["evidence"])
+                                              if tr else "{}"),
                 })
     cells_3d_df = (pd.DataFrame(rows, columns=cells_3d_cols)
                      if rows else pd.DataFrame(columns=cells_3d_cols))
@@ -417,6 +444,7 @@ def prepare_tile_25d(
             xy_seed=c.xy_seed, z_center=c.z_center, z_extent=c.z_extent,
             t_x=c.t_x, t_y=c.t_y, t_z=c.t_z,
             template_xs=c.template_xs, template_ys=c.template_ys,
+            type_resolution=c.type_resolution,
         )
         local_cells.append(new_c)
         if (xmin <= cx < xmax and ymin <= cy < ymax) and not c.cell_id.startswith("__unobs_"):
@@ -503,14 +531,18 @@ def prepare_tile_25d(
         )
 
     # Build cells_3d_df from owned cells (centroid strictly in tile)
+    from ..cell_type_resolver import evidence_to_json
     cells_3d_cols = ["cell_id", "cell_idx", "cell_type",
                        "centroid_x", "centroid_y", "z_center_um", "z_extent_um",
-                       "t_x", "t_y", "t_z", "is_unobserved"]
+                       "t_x", "t_y", "t_z", "is_unobserved",
+                       "cell_type_source", "cell_type_confidence",
+                       "cell_type_evidence"]
     rows = []
     for c in local_cells:
         cx, cy = c.xy_seed
         if (c.cell_id in owned_local_ids or c.cell_id.startswith("__unobs_")) \
                 and xmin <= cx < xmax and ymin <= cy < ymax:
+            tr = c.type_resolution
             rows.append({
                 "cell_id": c.cell_id, "cell_idx": c.cell_idx,
                 "cell_type": c.cell_type,
@@ -518,6 +550,11 @@ def prepare_tile_25d(
                 "z_center_um": c.z_center, "z_extent_um": c.z_extent,
                 "t_x": c.t_x, "t_y": c.t_y, "t_z": c.t_z,
                 "is_unobserved": c.cell_id.startswith("__unobs_"),
+                "cell_type_source": (tr["source"] if tr else None),
+                "cell_type_confidence": (float(tr["confidence"])
+                                            if tr else 0.0),
+                "cell_type_evidence": (evidence_to_json(tr["evidence"])
+                                          if tr else "{}"),
             })
     cells_3d_df = (pd.DataFrame(rows, columns=cells_3d_cols)
                      if rows else pd.DataFrame(columns=cells_3d_cols))

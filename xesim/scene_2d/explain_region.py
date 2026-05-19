@@ -47,16 +47,10 @@ class ExplainRegionResult:
 
 
 _ANN_CACHE: dict[str, dict[str, str]] = {}
-_TX_CLASSIFY_CACHE: dict[int, dict[str, str]] = {}
-# Resolver-style cache holding the FULL classifier dict (cell_id →
-# {cell_type_transcripts, cosine_top, type_uncertainty, type_scores}).
-# build_scene calls explain_region thousands of times per worker; without
-# this cache the classifier runs per tile and dominates wall-clock.
-_TX_CLASSIFY_FULL_CACHE: dict[int, dict[str, dict]] = {}
-# Stain-classifier latent bank cache: ~1.6MB NPZ per bundle. Reloading
-# per tile is wasteful (5k+ disk reads per full-bundle run); cache by
-# absolute path.
-_STAIN_BANK_CACHE: dict[str, tuple] = {}
+_TX_CLASSIFY_CACHE: dict[int, dict[str, str]] = {}  # legacy; kept for back-compat
+# Note: the resolver classifier+stain-bank caches now live in
+# xesim.cell_type_resolver._MODEL_TX_CACHE / _STAIN_BANK_CACHE — shared
+# across the 2D + 2.5D entry points.
 
 
 def _transcript_classified_types(model) -> dict[str, str]:
@@ -332,88 +326,31 @@ def explain_region(
     # in scene_io.scene_from_canonical_crop. Also do nucleus-cell remapping
     # so each cell's nucleus uses the cell's label.
     #
-    # Cell-type resolution flows through `xesim.cell_type_resolver`. The
-    # cascade is: annotation → transcripts → training → stain_knn. Each
-    # cell exits with a TypeResolution (cell_type + source + confidence +
-    # evidence) which is stamped onto the MechanisticCell's provenance
-    # under `type_resolution`. Cells that fall through all four tiers are
-    # left with cell_type=None for now (Phase 4 of the refactor makes the
-    # stain bank mandatory so this can't happen).
-    from ..cell_type_resolver import resolve_cell_types
-    annotation_map = _load_annotation(annotation_path) or {}
-    transcript_classifications: dict[str, dict] = {}
-    if model is not None and getattr(model, "transcripts_priors", None) is not None:
-        cache_key = id(model)
-        cached = _TX_CLASSIFY_FULL_CACHE.get(cache_key)
-        if cached is not None:
-            transcript_classifications = cached
-        else:
-            try:
-                transcript_classifications = model.classify_cells_by_transcripts()
-                _TX_CLASSIFY_FULL_CACHE[cache_key] = transcript_classifications
-            except Exception as e:
-                print(f"[explain_region] cellAdmix classification unavailable: {e}")
-                _TX_CLASSIFY_FULL_CACHE[cache_key] = {}
-    training_map: dict[str, int] = {}
-    training_type_names: list[str] = []
-    if hasattr(model, "cid_to_type"):
-        training_map = {str(k): int(v) for k, v in model.cid_to_type.items()}
-        training_type_names = list(model.type_names)
-    # Anchor cell_ids for this tile. cell_ids comes from the zarr/polygon
-    # loader and is aligned with np.unique(cell_label) anchor labels.
+    # Cell-type resolution flows through the shared
+    # `xesim.cell_type_resolver.resolve_from_model` helper. The cascade is
+    # annotation → transcripts → training → stain_knn; each cell exits
+    # with a TypeResolution (cell_type + source + confidence + evidence)
+    # stamped onto MechanisticCell.provenance['type_resolution'].
+    # 2.5D goes through the same helper from scene_2_5d.scene_first.
+    from ..cell_type_resolver import resolve_from_model
     anchor_cell_ids = [str(c) for c in cell_ids]
-
-    # Tier-4 (stain kNN) is encoder-latent and the cost scales with
-    # number-of-cells-to-encode. Skip it for cells the first three tiers
-    # already resolved. We do a quick lookahead with the three free tiers,
-    # then only invoke the bank for whatever's left.
-    _resolved_pre, _unresolved_pre = resolve_cell_types(
-        anchor_cell_ids,
-        annotation_map=annotation_map,
-        transcript_classifications=transcript_classifications,
-        training_map=training_map,
-        training_type_names=training_type_names,
-    )
-    stain_predictions: dict[str, str] = {}
-    if _unresolved_pre:
-        try:
-            bank_path = Path(model.paths.root) / "cell_latent_bank.npz"
-            if bank_path.exists():
-                # Compute centroids for the cells that need stain kNN.
-                label_for_cid = {str(c): int(lbl)
-                                  for c, lbl in zip(anchor_cell_ids,
-                                                      np.unique(cell_label)[
-                                                          np.unique(cell_label) > 0
-                                                      ][:len(anchor_cell_ids)])}
-                untyped_with_centroid: list[tuple[str, float, float]] = []
-                for cid in _unresolved_pre:
-                    lbl = label_for_cid.get(cid)
-                    if lbl is None: continue
-                    ys, xs = np.where(cell_label == int(lbl))
-                    if ys.size == 0: continue
-                    cy_um = float(ys.mean()) * float(model.pixel_size) + float(region_bounds_um[1])
-                    cx_um = float(xs.mean()) * float(model.pixel_size) + float(region_bounds_um[0])
-                    untyped_with_centroid.append((cid, cx_um, cy_um))
-                if untyped_with_centroid:
-                    from ..stain_classifier import classify_cells_by_centroid, load_bank
-                    bk_key = str(bank_path.resolve())
-                    bank = _STAIN_BANK_CACHE.get(bk_key)
-                    if bank is None:
-                        bank = load_bank(bank_path)
-                        _STAIN_BANK_CACHE[bk_key] = bank
-                    stain_predictions = classify_cells_by_centroid(
-                        model, bundle_path, untyped_with_centroid, bank=bank)
-        except Exception as e:
-            print(f"[explain_region] stain-classifier fallback skipped: {e}")
-
-    # Run the cascade once more with all four sources now available.
-    type_resolutions, _unresolved = resolve_cell_types(
-        anchor_cell_ids,
-        annotation_map=annotation_map,
-        transcript_classifications=transcript_classifications,
-        training_map=training_map,
-        training_type_names=training_type_names,
-        stain_predictions=stain_predictions,
+    # Per-cell centroids in scene-global µm (needed only if stain_knn
+    # fires). cell_ids and the sorted positive labels in cell_label are
+    # aligned by the zarr/polygon loader convention.
+    pos_labels = np.unique(cell_label)
+    pos_labels = pos_labels[pos_labels > 0][:len(anchor_cell_ids)]
+    centroids_um = np.zeros((len(anchor_cell_ids), 2), dtype=np.float32)
+    for i, lbl in enumerate(pos_labels):
+        ys, xs = np.where(cell_label == int(lbl))
+        if ys.size == 0: continue
+        centroids_um[i, 0] = (float(xs.mean()) * float(model.pixel_size)
+                                + float(region_bounds_um[0]))
+        centroids_um[i, 1] = (float(ys.mean()) * float(model.pixel_size)
+                                + float(region_bounds_um[1]))
+    type_resolutions, _unresolved = resolve_from_model(
+        anchor_cell_ids, centroids_um, model, bundle_path,
+        annotation_map=(_load_annotation(annotation_path) or None),
+        progress=False,
     )
     # Compat alias for the legacy code below that still uses cell_id_to_type.
     cell_id_to_type = {cid: r.cell_type for cid, r in type_resolutions.items()}
