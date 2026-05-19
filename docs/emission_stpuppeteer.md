@@ -11,8 +11,10 @@ parameters, or studying selective contamination effects.
 
 ## Quick-start: pancreas (377-gene panel)
 
-These examples use the included pancreas reference config and the
-`xesim_v21_model` fitted model. Adjust paths to your local setup.
+These examples use the included pancreas reference config at
+[`xesim/emission_stpuppeteer/reference_configs/pancreas.yml`](../xesim/emission_stpuppeteer/reference_configs/pancreas.yml)
+and the `xesim_v21_model` fitted model. Adjust paths to your local
+setup.
 
 **Single-tile 2D explain (~1 minute):**
 
@@ -144,8 +146,13 @@ at config load if a program references a gene that isn't in
 downstream tooling can't decode.
 
 A working reference for the pancreas-377 bundle is included at
-`xesim/emission_stpuppeteer/reference_configs/pancreas.yml`. Copy it as a
-starting point and tune.
+[`xesim/emission_stpuppeteer/reference_configs/pancreas.yml`](../xesim/emission_stpuppeteer/reference_configs/pancreas.yml).
+Copy it as a starting point and tune. It covers all 7 pancreas cell
+types (`Exocrine epithelial`, `Ductal/tumor epithelial`,
+`Fibroblast / CAF`, `Immune`, `Endothelial`, `Mural / pericyte`,
+`Endocrine`) with one program per type using real markers from the
+377-gene panel; loadings and per-cell-type leakage rates are
+hand-picked at plausible defaults, not fit to the bundle.
 
 ## Recipes
 
