@@ -1,6 +1,6 @@
 # STpuppeteer emission backend
 
-`xesim explain` ships two molecular-emission backends. The default
+`xesim explain` includes two molecular-emission backends. The default
 **legacy** backend samples transcripts from cellAdmix-fit NMF priors that
 mirror the real bundle's biology. The **STpuppeteer** backend instead
 emits transcripts from a *configurable* per-cell-type model — you decide
@@ -143,7 +143,7 @@ at config load if a program references a gene that isn't in
 `gene_panel.json` — otherwise you'd be emitting transcripts the
 downstream tooling can't decode.
 
-A working reference for the pancreas-377 bundle ships at
+A working reference for the pancreas-377 bundle is included at
 `xesim/emission_stpuppeteer/reference_configs/pancreas.yml`. Copy it as a
 starting point and tune.
 
@@ -211,6 +211,81 @@ Pass `--diagnostic` to either `explain` or `re-emit-molecules`:
 A JSON version (with cross-cell-type marker-specificity matrix) lands at
 `<diagnostic_dir>/emission_stpuppeteer.json`. Diff it between runs to
 see the effect of config changes.
+
+## How cell size factors into counts and halos
+
+Two parameters depend on each cell's *visible* size (post overlap
+resolution):
+
+1. **The per-cell size factor `s_c`** — multiplies the expected mean
+   count per gene in STpuppeteer's count sampler. Bigger cells emit
+   proportionally more transcripts.
+2. **The leak-halo radius `max_dist`** — controls how far leaked
+   transcripts can drift outside the cell.
+
+Both are computed from a single per-cell quantity:
+
+```
+N = visible_voxels = (cell_label == c).sum()
+S = N · pixel_area_um²        # for 2D this is the cell's visible area
+```
+
+…where `pixel_area_um²` is the area of one xy pixel (e.g. `0.2125² ≈ 0.045 µm²`
+at standard Xenium resolution). xeSim's overlap resolution runs before
+emission sees the label arrays, so a cell partially buried by a neighbor
+gets a smaller `N`, smaller `s_c`, smaller halo — no extra logic
+needed.
+
+### The 2D and 2.5D modes behave differently here
+
+This is implicit in the current implementation rather than configurable.
+There is **no `--scale-by` toggle** at present; you get whatever your
+scene mode hands the emitter.
+
+| Mode | `N` is… | Effective size factor | Halo radius `r_eff` |
+| --- | --- | --- | --- |
+| 2D | 2D pixel count inside `cell_label == c` | **area-based**: `N` / mean `N` within celltype = cell area / mean cell area | `sqrt(S / π)` — proper 2D effective radius derived from area |
+| 2.5D | 3D voxel count inside `cell_label_3d == c` (the cell's body summed across z-planes) | **volume-based**: 3D volume / mean 3D volume within celltype | `sqrt(S / π)` — a hybrid: `N` is now 3D, but it's multiplied by 2D pixel area, not voxel volume. Not the true `(3V/4π)^(1/3)` 3D sphere radius |
+
+What this means in practice:
+
+- **In 2D**, a cell that's twice as big in xy gets `s_c = 2` (relative to
+  the within-celltype mean) and a halo radius √2× larger. Standard.
+- **In 2.5D**, a cell that's twice as thick in z (same xy footprint) gets
+  `s_c = 2` and a halo radius √2× larger. Thicker cells therefore emit
+  more transcripts AND have wider halos. This is biologically
+  defensible (a thicker cell has more cytoplasm; more material to leak)
+  but it's not the only reasonable choice — a pure xy-projection
+  approach would keep the halo radius matched to the 2D footprint
+  regardless of z-extent.
+- **The `r_eff` formula in 2.5D is a hybrid**: `N` is the 3D voxel
+  count, but `S = N · pixel_area_um²` multiplies it by 2D pixel area,
+  not voxel volume (`pixel_area_um² · z_step_um`). The result scales
+  plausibly (thicker cells → larger halos), but if you compute the
+  "true" cell volume from `r_eff` and back out a sphere radius, the
+  numbers won't match. Treat `r_eff` as an opaque halo length scale
+  rather than a literal radius in 2.5D.
+
+If you need a particular convention (e.g., volume-based for both modes,
+or xy-projection for 2.5D), open an issue — the design doc lists this
+as a candidate for a `--scale-by {area, volume, xy_projection}` flag in
+a future phase. Currently the behavior is single-track per mode.
+
+### When this matters
+
+- **Calibrating counts**: if you're tuning a config to match a target
+  mean count, remember 2.5D's effective `s_c` includes z-extent. A cell
+  that's 12 z-planes deep emits ~12× more than a single-plane cell of
+  the same xy footprint, all else equal. If that's not what you want,
+  the right knob is the activation matrix in `cell_type_specs`, not
+  per-cell rescaling.
+- **Comparing 2D and 2.5D outputs on the same bundle**: identical
+  config → 2.5D will emit substantially more transcripts because of the
+  z-extent multiplier. This is intentional; don't interpret it as a bug.
+- **Cells with extreme z-extent** (e.g., near-collapsed at a slice
+  boundary, or unusually thick) get correspondingly small/large halos.
+  In practice xeSim's 2.5D scene composition keeps z-extents in a
+  narrow range so this isn't usually visible.
 
 ## Known limitations
 
