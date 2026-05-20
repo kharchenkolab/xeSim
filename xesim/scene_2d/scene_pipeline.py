@@ -329,6 +329,55 @@ def _drop_ghosts_to_target(
     return out, dropped
 
 
+def _compact_scene_for_storage(scene: Scene2D) -> Scene2D:
+    """Shrink a finished tile scene's RAM before it accumulates in the
+    parent's ``scenes_out`` list.
+
+    The render is already done, so the parent only needs the label masks
+    for metadata extraction (polygons, centroids, areas) and the molecules
+    for the transcript/cells tables. Both store more compactly with
+    *identical values*, so all downstream extraction is unchanged:
+
+      * cell_label/nucleus_label int32 -> uint16 (per-tile labels are local
+        and small; halves mask RAM). Guarded by a < 65536 check. This is
+        the dominant win: ~33 GB -> ~16 GB of mask RAM on full breast.
+      * molecule float64 coords (x, y, qv) -> float32. The bundle writer
+        already emits these as float32, so there is zero precision change
+        vs the written output; this just stops the parent holding the
+        wider copy during accumulation.
+
+    On full breast (~11.5k tiles, ~200M molecules) this keeps the parent's
+    scenes_out near ~35 GB during tile accumulation — the phase where the
+    parent coexists with the worker pool — instead of ~70 GB.
+
+    String columns (gene/true_cell_id/source_cell_type) are intentionally
+    left alone: pandas already stores them in the compact ``str`` dtype,
+    and converting the high-cardinality ``true_cell_id`` to category would
+    force an expensive category union at the final concat for no RAM win.
+    """
+    from dataclasses import replace as _replace
+
+    mech = scene.mech_scene
+    cl, nl = mech.cell_label, mech.nucleus_label
+    if cl is not None and nl is not None and cl.dtype != np.uint16:
+        if int(cl.max(initial=0)) < 65536 and int(nl.max(initial=0)) < 65536:
+            mech = _replace(mech, cell_label=cl.astype(np.uint16),
+                            nucleus_label=nl.astype(np.uint16))
+
+    mols = scene.molecules
+    if len(mols) > 0:
+        comp: dict[str, pd.Series] = {}
+        for c in ("x", "y", "qv"):
+            if c in mols.columns and mols[c].dtype == np.float64:
+                comp[c] = mols[c].astype(np.float32)
+        if comp:
+            mols = mols.assign(**comp)
+
+    if mech is scene.mech_scene and mols is scene.molecules:
+        return scene
+    return _replace(scene, mech_scene=mech, molecules=mols)
+
+
 def _feather_mask(tile_px: int, overlap_px: int) -> np.ndarray:
     """Linear-ramp feather mask: 1 inside, ramping to 0 at each edge.
 
@@ -638,7 +687,7 @@ def build_scene(
         total_ghosts += n_ghost_t
         total_tx_proposed += n_tx_t
         total_mols += int(len(owned.molecules))
-        scenes_out.append(owned)
+        scenes_out.append(_compact_scene_for_storage(owned))
 
     import time as _time
     _t_start = _time.time()
