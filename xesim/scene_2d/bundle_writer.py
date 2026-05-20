@@ -939,15 +939,24 @@ def write_bundle(
 
     written: dict[str, Any] = {"output_dir": str(out_dir)}
 
+    # CSV.gz mirror writes are expensive (~25% of bundle-write wall time
+    # on whole-pancreas profile via py-spy). They duplicate .parquet
+    # data 1:1 for tools that don't speak Arrow. Set XESIM_SKIP_CSV_GZ=1
+    # to skip them (parquet covers all data; synth bundles consumed
+    # directly by xeSim diagnostics / Xenium Explorer don't need csv).
+    import os as _os
+    _skip_csv = _os.environ.get("XESIM_SKIP_CSV_GZ", "").strip() == "1"
+
     # 1. Transcripts (with TRUE cell_id; ghost-cell molecules carry ghost IDs)
     transcripts_df = _build_transcripts_df(scenes_list, rng=rng)
     transcripts_df.to_parquet(out_dir / "transcripts.parquet", index=False)
-    transcripts_df.to_csv(out_dir / "transcripts.csv.gz",
-                            index=False, compression="gzip")
+    if not _skip_csv:
+        transcripts_df.to_csv(out_dir / "transcripts.csv.gz",
+                                index=False, compression="gzip")
     written["transcripts"] = {
         "n_rows": int(len(transcripts_df)),
         "parquet": str(out_dir / "transcripts.parquet"),
-        "csv_gz": str(out_dir / "transcripts.csv.gz"),
+        **({"csv_gz": str(out_dir / "transcripts.csv.gz")} if not _skip_csv else {}),
     }
 
     # 2. Cell boundaries — anchors only (ground-truth polygons).
@@ -980,22 +989,24 @@ def write_bundle(
     cells_df = _polygons_to_long_df(anchor_cell_polys)
     nucs_df = _polygons_to_long_df(anchor_nuc_polys)
     cells_df.to_parquet(out_dir / "cell_boundaries.parquet", index=False)
-    cells_df.to_csv(out_dir / "cell_boundaries.csv.gz",
-                      index=False, compression="gzip")
     nucs_df.to_parquet(out_dir / "nucleus_boundaries.parquet", index=False)
-    nucs_df.to_csv(out_dir / "nucleus_boundaries.csv.gz",
-                     index=False, compression="gzip")
+    if not _skip_csv:
+        cells_df.to_csv(out_dir / "cell_boundaries.csv.gz",
+                          index=False, compression="gzip")
+        nucs_df.to_csv(out_dir / "nucleus_boundaries.csv.gz",
+                         index=False, compression="gzip")
     written["cell_boundaries"] = {"n_anchor_cells": int(cells_df["cell_id"].nunique())}
 
     # 2b. cells.parquet + cells.csv.gz — public per-cell metadata (anchors only)
     real_cells_df = _build_real_cells_df(scenes_list, transcripts_df)
     real_cells_df.to_parquet(out_dir / "cells.parquet", index=False)
-    real_cells_df.to_csv(out_dir / "cells.csv.gz",
-                           index=False, compression="gzip")
+    if not _skip_csv:
+        real_cells_df.to_csv(out_dir / "cells.csv.gz",
+                               index=False, compression="gzip")
     written["cells"] = {
         "n_cells": int(len(real_cells_df)),
         "parquet": str(out_dir / "cells.parquet"),
-        "csv_gz": str(out_dir / "cells.csv.gz"),
+        **({"csv_gz": str(out_dir / "cells.csv.gz")} if not _skip_csv else {}),
     }
 
     # 3. Morphology image(s) — calibrated uint16 + 8-level pyramid + 4 focus files
