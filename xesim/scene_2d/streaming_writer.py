@@ -495,17 +495,19 @@ class StreamingStitchWriter:
                          subfiletype=1, compression=self.compression)
 
     def _write_morphology_z_file(self, out_path: Path, dapi_idx: int) -> None:
-        """Write morphology.ome.tif (n_z-broadcast DAPI z-stack pyramid)."""
+        """Write morphology.ome.tif (n_z-broadcast DAPI z-stack pyramid).
+
+        Real Xenium morphology.ome.tif has 12 z-slices; the 2D writer
+        broadcasts the single focal plane to all n_z slices so Xenium
+        Explorer's z-slider works. We write each z-plane via a generator
+        so the full ``(n_z, H, W)`` array is NEVER materialised — on full
+        breast that array would be ~93 GB and OOM. Per-plane streaming
+        keeps RAM at one (H, W) plane (~7.7 GB on breast).
+        """
         import tifffile
+        n_z = 12
 
         levels = self._build_pyramid_levels_for_channel(dapi_idx)
-        # Real Xenium morphology.ome.tif has 12 z-slices; the existing
-        # 2D writer broadcasts the single focal plane to all 12 slices
-        # so Xenium Explorer's z-slider works. Match that default.
-        n_z = 12
-        z_levels = [np.broadcast_to(lvl, (n_z, *lvl.shape)).copy()
-                    for lvl in levels]
-
         metadata = {
             "axes": "ZYX",
             "PhysicalSizeX": self.pixel_size_um, "PhysicalSizeXUnit": "µm",
@@ -513,19 +515,30 @@ class StreamingStitchWriter:
             "PhysicalSizeZ": 0.75, "PhysicalSizeZUnit": "µm",
             "Channel": {"Name": ["DAPI"]},
         }
-        bytes_total = sum(int(np.prod(lvl.shape)) * lvl.dtype.itemsize
-                          for lvl in z_levels)
+        # bytes_total counts ONE copy per level × n_z (the on-disk size,
+        # pre-compression) to decide BigTIFF.
+        bytes_total = n_z * sum(int(np.prod(lvl.shape)) * lvl.dtype.itemsize
+                                for lvl in levels)
         use_bigtiff = bytes_total > 3 * (1 << 30)
-        n_sub = max(0, len(z_levels) - 1)
+        n_sub = max(0, len(levels) - 1)
+
+        def _z_planes(level: np.ndarray):
+            """Yield the same (H, W) plane n_z times — lazy z-broadcast."""
+            plane = np.asarray(level)
+            for _ in range(n_z):
+                yield plane
 
         if out_path.exists():
             out_path.unlink()
         with tifffile.TiffWriter(out_path, ome=True, bigtiff=use_bigtiff) as tw:
-            tw.write(z_levels[0], photometric="minisblack",
-                     metadata=metadata, subifds=n_sub,
-                     compression=self.compression)
-            for sub in z_levels[1:]:
-                tw.write(sub, photometric="minisblack", subfiletype=1,
+            tw.write(_z_planes(levels[0]),
+                     shape=(n_z, *levels[0].shape), dtype=levels[0].dtype,
+                     photometric="minisblack", metadata=metadata,
+                     subifds=n_sub, compression=self.compression)
+            for sub in levels[1:]:
+                tw.write(_z_planes(sub),
+                         shape=(n_z, *sub.shape), dtype=sub.dtype,
+                         photometric="minisblack", subfiletype=1,
                          compression=self.compression)
 
     def _build_pyramid_levels_for_channel(
