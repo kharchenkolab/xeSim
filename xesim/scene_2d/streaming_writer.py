@@ -152,16 +152,16 @@ class StreamingStitchWriter:
         # Disk workspace
         self._tmpdir = Path(tempfile.mkdtemp(prefix="xesim_stream_"))
 
-        # Row-ring: 2 consecutive input rows live at any time.
-        # Each entry is (value, weight) memmap-bands of shape
-        # (n_ch, tile_px, W_total) and (tile_px, W_total) respectively.
-        # We use memmap so the ring's working set is independent of
-        # bundle width (the kernel page-caches actively-touched columns).
+        # Row-ring: 2 consecutive input rows live at any time. Each
+        # entry is a (value, weight) tuple of in-RAM float32 arrays of
+        # shape (n_ch, tile_px, W_total) and (tile_px, W_total). Size
+        # is bounded by ``2 * n_ch * tile_px * W * 4 bytes`` — ~1 GB
+        # on breast 5K (W=51720, tile=602, 4 ch). Memmap-backing
+        # showed ~50% per-tile slowdown vs RAM in benches; the ring
+        # fits in RAM on any bundle we care about.
         self._ring_band_h = self.tile_px
-        self._ring_value_paths: dict[int, Path] = {}
-        self._ring_weight_paths: dict[int, Path] = {}
-        self._ring_value: dict[int, np.memmap] = {}
-        self._ring_weight: dict[int, np.memmap] = {}
+        self._ring_value: dict[int, np.ndarray] = {}
+        self._ring_weight: dict[int, np.ndarray] = {}
 
         # Per-row tile-arrival count
         self._arrived = np.zeros(self.n_rows, dtype=np.int32)
@@ -245,17 +245,11 @@ class StreamingStitchWriter:
             self._try_finalize_around(row)
 
     def _alloc_ring_row(self, row: int) -> None:
-        """Allocate one row of the ring on disk + memmap it."""
-        v = self._tmpdir / f"ring_value_r{row:05d}.f32"
-        w = self._tmpdir / f"ring_weight_r{row:05d}.f32"
-        self._ring_value_paths[row] = v
-        self._ring_weight_paths[row] = w
-        self._ring_value[row] = np.memmap(
-            v, dtype=np.float32, mode="w+",
-            shape=(self.n_ch, self.tile_px, self.W))
-        self._ring_weight[row] = np.memmap(
-            w, dtype=np.float32, mode="w+",
-            shape=(self.tile_px, self.W))
+        """Allocate one row of the ring in RAM."""
+        self._ring_value[row] = np.zeros(
+            (self.n_ch, self.tile_px, self.W), dtype=np.float32)
+        self._ring_weight[row] = np.zeros(
+            (self.tile_px, self.W), dtype=np.float32)
 
     def _drop_ring_row(self, row: int) -> None:
         """Release a ring entry once its strips have been emitted."""
@@ -263,11 +257,6 @@ class StreamingStitchWriter:
             return
         del self._ring_value[row]
         del self._ring_weight[row]
-        try:
-            self._ring_value_paths.pop(row).unlink(missing_ok=True)
-            self._ring_weight_paths.pop(row).unlink(missing_ok=True)
-        except (KeyError, OSError):
-            pass
 
     # -----------------------------------------------------------------
     # Strip finalization
