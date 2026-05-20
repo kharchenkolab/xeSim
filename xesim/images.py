@@ -253,19 +253,21 @@ def _read_plane_region(
         raise RuntimeError("tifffile is required for OME-TIFF image crops")
     try:
         import zarr  # type: ignore
-        store = tifffile.imread(path, aszarr=True)
-        try:
-            root = zarr.open(store, mode="r")
-            # Pyramidal Xenium TIFFs expose an array group keyed by level
-            # ("0" is full res). Plain TIFFs come through as an array.
-            top = root["0"] if hasattr(root, "array_keys") else root
+        # Read THIS file's own first page — must match _read_full_plane,
+        # which uses imread(path, key=0). Do NOT use imread(path,
+        # aszarr=True): for Xenium morphology the OME-XML in
+        # morphology_focus_0000 aggregates the 4 single-channel companion
+        # files (0000..0003) into one multi-channel series, so slicing its
+        # channel-0 returns DAPI for EVERY channel file — silently
+        # corrupting the membrane/18S/SMA conditioning on every region/
+        # whole-bundle render (the v17→ regression). Reading at the page
+        # level stays scoped to the file actually requested.
+        with tifffile.TiffFile(path) as tf:
+            za = zarr.open(tf.pages[0].aszarr(), mode="r")
             # Strip leading axes to land on a 2D plane (matches
             # `_first_plane`): take index 0 along every dim > 2.
-            idx: tuple = (0,) * (top.ndim - 2) + (slice(y0, y1), slice(x0, x1))
-            return np.asarray(top[idx])
-        finally:
-            try: store.close()
-            except Exception: pass
+            idx: tuple = (0,) * (za.ndim - 2) + (slice(y0, y1), slice(x0, x1))
+            return np.asarray(za[idx])
     except Exception:
         # Defensive fallback: full-plane read + slice. Loses the memory
         # win but preserves correctness if the zarr path is unavailable.
