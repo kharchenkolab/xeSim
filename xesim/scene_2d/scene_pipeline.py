@@ -329,52 +329,53 @@ def _drop_ghosts_to_target(
     return out, dropped
 
 
-def _compact_scene_for_storage(scene: Scene2D) -> Scene2D:
-    """Shrink a finished tile scene's RAM before it accumulates in the
-    parent's ``scenes_out`` list.
+_EMPTY_LABEL = np.zeros((0, 0), dtype=np.uint16)
 
-    The render is already done, so the parent only needs the label masks
-    for metadata extraction (polygons, centroids, areas) and the molecules
-    for the transcript/cells tables. Both store more compactly with
-    *identical values*, so all downstream extraction is unchanged:
 
-      * cell_label/nucleus_label int32 -> uint16 (per-tile labels are local
-        and small; halves mask RAM). Guarded by a < 65536 check. This is
-        the dominant win: ~33 GB -> ~16 GB of mask RAM on full breast.
-      * molecule float64 coords (x, y, qv) -> float32. The bundle writer
-        already emits these as float32, so there is zero precision change
-        vs the written output; this just stops the parent holding the
-        wider copy during accumulation.
+def _extract_and_strip(scene: Scene2D, geom_stash: dict[str, dict]) -> Scene2D:
+    """Extract a finished tile scene's per-cell geometry into ``geom_stash``
+    (keyed by cell_id) and return a stripped scene whose label masks are
+    freed, so the parent's ``scenes_out`` list does not accumulate them.
 
-    On full breast (~11.5k tiles, ~200M molecules) this keeps the parent's
-    scenes_out near ~35 GB during tile accumulation — the phase where the
-    parent coexists with the worker pool — instead of ~70 GB.
+    The render is already done; the masks exist only to derive (a) polygons
+    + centroid/area for the boundary/cells tables and (b) the per-molecule
+    ``overlaps_nucleus`` flag for transcripts. We compute both once, per
+    tile, while the mask is still resident — geometry via
+    :func:`extract_scene_geometry` into ``geom_stash`` (keyed by cell_id),
+    and ``overlaps_nucleus`` as a molecule column — then drop the masks.
+    The bundle writer rebuilds the boundary/cells tables from ``geom_stash``
+    reading the *final* cell objects (post-ghost-drop, post-stamp) for
+    type/identity, so ghost-drop and transcript-stamping are handled
+    automatically.
 
-    String columns (gene/true_cell_id/source_cell_type) are intentionally
-    left alone: pandas already stores them in the compact ``str`` dtype,
-    and converting the high-cardinality ``true_cell_id`` to category would
-    force an expensive category union at the final concat for no RAM win.
+    On full breast (~11.5k tiles) this removes the ~33 GB of accumulated
+    int32 masks from parent RAM — the dominant scaling term. Molecule
+    columns are left untouched so transcripts.parquet stays byte-identical
+    to the legacy mask-reading path.
     """
     from dataclasses import replace as _replace
+    from .bundle_writer import extract_scene_geometry
+
+    geom_stash.update(extract_scene_geometry(scene))
 
     mech = scene.mech_scene
-    cl, nl = mech.cell_label, mech.nucleus_label
-    if cl is not None and nl is not None and cl.dtype != np.uint16:
-        if int(cl.max(initial=0)) < 65536 and int(nl.max(initial=0)) < 65536:
-            mech = _replace(mech, cell_label=cl.astype(np.uint16),
-                            nucleus_label=nl.astype(np.uint16))
-
     mols = scene.molecules
-    if len(mols) > 0:
-        comp: dict[str, pd.Series] = {}
-        for c in ("x", "y", "qv"):
-            if c in mols.columns and mols[c].dtype == np.float64:
-                comp[c] = mols[c].astype(np.float32)
-        if comp:
-            mols = mols.assign(**comp)
 
-    if mech is scene.mech_scene and mols is scene.molecules:
-        return scene
+    # Precompute overlaps_nucleus (molecule pixel ∈ a nucleus) while the
+    # nucleus mask is still alive — same math as _build_transcripts_df.
+    if (len(mols) > 0 and "overlaps_nucleus" not in mols.columns
+            and mech.nucleus_label is not None and mech.nucleus_label.size):
+        nuc_lbl = mech.nucleus_label
+        psz = scene.pixel_size
+        px = mols["x"].to_numpy(dtype=np.float64) / psz
+        py = mols["y"].to_numpy(dtype=np.float64) / psz
+        h, w = nuc_lbl.shape
+        px_i = np.clip(np.round(px).astype(np.int64), 0, w - 1)
+        py_i = np.clip(np.round(py).astype(np.int64), 0, h - 1)
+        mols = mols.assign(
+            overlaps_nucleus=(nuc_lbl[py_i, px_i] > 0).astype(np.uint8))
+
+    mech = _replace(mech, cell_label=_EMPTY_LABEL, nucleus_label=_EMPTY_LABEL)
     return _replace(scene, mech_scene=mech, molecules=mols)
 
 
@@ -622,6 +623,7 @@ def build_scene(
             shape=(H_total, W_total),
         )
     scenes_out: list[Scene2D] = []
+    geom_stash: dict[str, dict] = {}     # cell_id -> geometry+polys (masks freed)
     seen_anchor_ids: set[str] = set()    # global anchor-ownership dedupe
     ghost_id_offset = 0
     total_anchors = 0
@@ -687,7 +689,7 @@ def build_scene(
         total_ghosts += n_ghost_t
         total_tx_proposed += n_tx_t
         total_mols += int(len(owned.molecules))
-        scenes_out.append(_compact_scene_for_storage(owned))
+        scenes_out.append(_extract_and_strip(owned, geom_stash))
 
     import time as _time
     _t_start = _time.time()
@@ -838,6 +840,7 @@ def build_scene(
 
     return {
         "scenes": scenes_out,
+        "geom_stash": geom_stash,
         "stitched_image": stitched,
         "morphology_already_written": morphology_already_written,
         "stitch_cleanup": _cleanup_stitch,

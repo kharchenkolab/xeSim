@@ -596,6 +596,7 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
             intensity_mode=calib_mode,
             real_bundle_path=args.bundle,
             display_lut=display_lut,
+            geom_stash=result.get("geom_stash"),
         )
         if result.get("morphology_already_written"):
             written["morphology"] = {
