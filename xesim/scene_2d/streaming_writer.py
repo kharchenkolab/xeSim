@@ -148,6 +148,15 @@ class StreamingStitchWriter:
         self.progress = progress
         self.feather = _feather_mask(self.tile_px, self.overlap_px) \
                        if self.overlap_px > 0 else None
+        # OME-TIFF compression. Real Xenium morphology TIFFs are
+        # compressed (JPEG-2000); for the streaming path (large bundles)
+        # we default to ZSTD — lossless, fast, and crucial for the
+        # morphology.ome.tif z-stack which broadcasts the single focal
+        # plane to 12 identical z-slices (12x redundancy → compresses to
+        # ~1x). Disable with XESIM_TIFF_COMPRESSION=none.
+        import os as _os
+        _comp = _os.environ.get("XESIM_TIFF_COMPRESSION", "zstd").strip().lower()
+        self.compression = None if _comp in ("none", "", "raw") else _comp
 
         # Disk workspace
         self._tmpdir = Path(tempfile.mkdtemp(prefix="xesim_stream_"))
@@ -479,10 +488,11 @@ class StreamingStitchWriter:
             out_path.unlink()
         with tifffile.TiffWriter(out_path, ome=True, bigtiff=use_bigtiff) as tw:
             tw.write(np.asarray(levels[0]), photometric="minisblack",
-                     metadata=metadata, subifds=n_sub)
+                     metadata=metadata, subifds=n_sub,
+                     compression=self.compression)
             for sub in levels[1:]:
                 tw.write(np.asarray(sub), photometric="minisblack",
-                         subfiletype=1)
+                         subfiletype=1, compression=self.compression)
 
     def _write_morphology_z_file(self, out_path: Path, dapi_idx: int) -> None:
         """Write morphology.ome.tif (n_z-broadcast DAPI z-stack pyramid)."""
@@ -512,9 +522,11 @@ class StreamingStitchWriter:
             out_path.unlink()
         with tifffile.TiffWriter(out_path, ome=True, bigtiff=use_bigtiff) as tw:
             tw.write(z_levels[0], photometric="minisblack",
-                     metadata=metadata, subifds=n_sub)
+                     metadata=metadata, subifds=n_sub,
+                     compression=self.compression)
             for sub in z_levels[1:]:
-                tw.write(sub, photometric="minisblack", subfiletype=1)
+                tw.write(sub, photometric="minisblack", subfiletype=1,
+                         compression=self.compression)
 
     def _build_pyramid_levels_for_channel(
         self, ch_idx: int,
