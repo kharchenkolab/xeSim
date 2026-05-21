@@ -25,6 +25,53 @@ def _polygon_area_um2(xs: np.ndarray, ys: np.ndarray) -> float:
                               np.dot(ys, np.roll(xs, -1))))
 
 
+def real_dapi_zstack_target(
+    real_bundle_path: str | Path,
+    bounds_um: tuple[float, float, float, float],
+    pixel_size_um: float,
+    *,
+    max_px: int = 2048,
+) -> tuple[float, float] | None:
+    """Global ``(lo, hi)`` DAPI calibration target from the real bundle's 3D
+    DAPI z-stack (``morphology.ome.tif``) — the ground truth the synth z-stack
+    should match in intensity scale.
+
+    Read at FULL resolution (downsampled pyramid levels bias the p99 down by
+    averaging out peaks) over ``bounds_um``, but bounded to a central
+    ``max_px`` window so a whole-bundle request still does only a small,
+    tile-scoped zarr read. Returns ``(p1, p99)`` of nonzero voxels pooled
+    across z (a single global per-bundle stat → streaming-safe). ``None`` if
+    unavailable.
+    """
+    import tifffile
+    import zarr
+    p = Path(real_bundle_path) / "morphology.ome.tif"
+    if not p.exists():
+        return None
+    try:
+        x0, y0, x1, y1 = bounds_um
+        px0 = max(0, int(x0 / pixel_size_um)); px1 = int(x1 / pixel_size_um)
+        py0 = max(0, int(y0 / pixel_size_um)); py1 = int(y1 / pixel_size_um)
+        # Bound to a central max_px window (keeps whole-bundle reads cheap).
+        if px1 - px0 > max_px:
+            cx = (px0 + px1) // 2; px0, px1 = cx - max_px // 2, cx + max_px // 2
+        if py1 - py0 > max_px:
+            cy = (py0 + py1) // 2; py0, py1 = cy - max_px // 2, cy + max_px // 2
+        with tifffile.TiffFile(p) as tf:
+            # series.aszarr() is a multiscale GROUP keyed "0".."N"; "0" is the
+            # full-res (z, H, W) array. Region-slice it so only overlapping
+            # chunks are decoded (cheap even for a whole-bundle request).
+            root = zarr.open(tf.series[0].aszarr(), mode="r")
+            arr0 = root["0"] if hasattr(root, "keys") else root
+            sub = np.asarray(arr0[:, py0:py1, px0:px1])
+        nz = sub[sub > 0].astype(np.float32)
+        if nz.size < 100:
+            return None
+        return float(np.percentile(nz, 1)), float(np.percentile(nz, 99))
+    except Exception:
+        return None
+
+
 def write_bundle_25d(
     *,
     output_dir: str | Path,
@@ -227,27 +274,35 @@ def write_bundle_25d(
 
     # 3. Morphology: multi-z DAPI in morphology.ome.tif
     dapi_zstack = compose_result.dapi_zstack    # (n_z, H, W) float32 in [0, 1]
-    # Apply display-LUT calibration to DAPI channel (matches 2D bundle).
-    # Without LUT, plain *4095 saturates DAPI peaks. With LUT lo=43 hi=3841
-    # (pancreas), p99=1.0 maps to ≈3841 — preserves channel ratios vs the
-    # focal-plane DAPI written below.
-    from ..scene_2d.render_tile import load_model_display_lut as _llut
-    _lut = display_lut if display_lut is not None else _llut(str(model.paths.root))
-    _dapi_lo, _dapi_hi = 0.0, 4095.0
-    if _lut is not None:
-        for c in _lut.get("channels", []):
-            if int(c.get("channel_index", -1)) == 0:
-                _dapi_lo = float(c.get("lo", 0.0))
-                _dapi_hi = float(c.get("hi", 4095.0))
-                break
-    if target_intensity_stats is not None and "DAPI" in target_intensity_stats:
-        # Caller-provided target stats override (rare, opt-in)
-        p50, p99 = target_intensity_stats["DAPI"]
-        scale = float(p99) / 4095.0
-        zstack_u16 = np.clip(dapi_zstack / max(scale, 1e-6) * 4095.0,
+    # Calibrate the DAPI z-stack to the REAL bundle's 3D DAPI z-stack
+    # (morphology.ome.tif) — the ground truth — via a SINGLE GLOBAL 2-point
+    # affine: synth (p1, p99) → real (p1, p99). One scale for the whole stack
+    # (NOT per-z): fixes the intensity scale while preserving the synth
+    # z-profile, so any z-spread mismatch stays a visible render-side signal
+    # rather than being masked. The synth z-stack is a full (memmap-backed)
+    # array here, so its global stats are exact — no per-strip seam issue.
+    # Falls back to the model display-LUT mapping when the real z-stack is
+    # unavailable.
+    real_lohi = (real_dapi_zstack_target(real_bundle_path,
+                                         compose_result.region_bounds_um, psz)
+                 if real_bundle_path else None)
+    _nz = dapi_zstack[dapi_zstack > 0]
+    if real_lohi is not None and _nz.size > 0:
+        s_lo = float(np.percentile(_nz, 1)); s_hi = float(np.percentile(_nz, 99))
+        r_lo, r_hi = real_lohi
+        scale = (r_hi - r_lo) / max(s_hi - s_lo, 1e-6)
+        zstack_u16 = np.clip((dapi_zstack - s_lo) * scale + r_lo,
                               0, 65535).astype(np.uint16)
     else:
-        # Default: LUT-native mapping [0,1] → [lo, hi]
+        from ..scene_2d.render_tile import load_model_display_lut as _llut
+        _lut = display_lut if display_lut is not None else _llut(str(model.paths.root))
+        _dapi_lo, _dapi_hi = 0.0, 4095.0
+        if _lut is not None:
+            for c in _lut.get("channels", []):
+                if int(c.get("channel_index", -1)) == 0:
+                    _dapi_lo = float(c.get("lo", 0.0))
+                    _dapi_hi = float(c.get("hi", 4095.0))
+                    break
         zstack_u16 = np.clip(_dapi_lo + dapi_zstack * (_dapi_hi - _dapi_lo),
                               0, 65535).astype(np.uint16)
     morph_path = out_dir / "morphology.ome.tif"
