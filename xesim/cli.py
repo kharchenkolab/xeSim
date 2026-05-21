@@ -578,6 +578,7 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
             real_bundle_path=args.bundle,
             display_lut=display_lut,
             geom_stash=result.get("geom_stash"),
+            model_dir=str(args.model),
         )
         if result.get("morphology_already_written"):
             written["morphology"] = {
@@ -652,6 +653,7 @@ def _write_bundle_single(model, args, scene, image, bounds, rng) -> None:
         target_intensity_quantiles=target_quantiles,
         intensity_mode=calib_mode,
         real_bundle_path=args.bundle,
+        model_dir=str(args.model),
     )
     print(f"[explain] Done.")
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
@@ -982,14 +984,18 @@ def build_parser() -> argparse.ArgumentParser:
                             "present, else 1.0. Pancreas v21 ~1.18 closes "
                             "the per-tile boundary-loss gap. Override here.")
     exp.add_argument("--intensity-calibration",
-                       choices=["off", "scale", "match2", "histmatch",
-                                "lut_native", "lut_zerofloor"],
-                       default="off",
-                       help="per-channel brightness handling. "
-                            "off: per-render p99.5 → 4095 (viewer-friendly). "
-                            "scale: synth_p99.5 → real_bundle_p99.5. "
-                            "match2: 2-anchor (p50, p99.5). "
-                            "histmatch: full quantile remap.")
+                       choices=["lut_native", "lut_zerofloor", "scale",
+                                "match2", "histmatch", "none"],
+                       default="lut_native",
+                       help="renderer float → uint16 morphology mapping. "
+                            "LUT family (honest affine to real Xenium scale): "
+                            "lut_native [default] maps [0,1]→[lo,hi] preserving "
+                            "channel ratios + scale; lut_zerofloor maps →[0,hi]. "
+                            "target-stat family (linear, tuned to real): scale "
+                            "(synth_p99.5→real_p99.5), match2 (p50+p99.5). "
+                            "histmatch: non-linear per-channel quantile remap to "
+                            "real (masks renderer differences). none: raw fixed "
+                            "×4095 scale, no per-channel/LUT/stat adjustment.")
 
     # Misc
     exp.add_argument("--inference-tile-px", type=int, default=None,
