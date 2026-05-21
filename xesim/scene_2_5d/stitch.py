@@ -1,7 +1,9 @@
 """Tile-and-stitch for 2.5D scenes.
 
-`build_scene_25d` tiles a region into overlapping chunks, runs
-`compose_region_scene_25d` per tile, and stitches multi-z DAPI +
+`build_scene_25d` tiles a region into overlapping chunks. It runs the
+scene-first precompute (`precompute_scene_25d`: cells, tilts, ONE global
+MRF) once, then renders each tile via `render_tile_from_shared` (serial
+loop or a worker pool — both the same path), and stitches multi-z DAPI +
 transcripts + cells_3d into a single bundle. Memory bounded by the
 per-tile cost (~1 GB at 500 µm tiles) regardless of total region size.
 """
@@ -206,25 +208,6 @@ def build_scene_25d(
     all_molecules: list[pd.DataFrame] = []
     all_cells_3d: list[pd.DataFrame] = []
     seen_cell_ids: set[str] = set()
-
-    def _run_tile(k_xy):
-        k, (tx0, ty0) = k_xy
-        tx1 = min(tx0 + tile_um, xmax)
-        ty1 = min(ty0 + tile_um, ymax)
-        if tx1 - tx0 < 5 or ty1 - ty0 < 5:
-            return None
-        res = compose_region_scene_25d(
-            model, bundle_path, region_bounds_um=(tx0, ty0, tx1, ty1),
-            z_step_um=z_step_um, imaged_depth_um=imaged_depth_um,
-            rng=np.random.default_rng(int(rng.integers(0, 2**31-1))),
-            progress=False,
-            rescale_dapi=False,    # disable per-tile rescale; we'll do global after stitch
-            model_dir=model_dir,
-        )
-        return (k, (tx0, ty0, tx1, ty1),
-                res.dapi_zstack.astype(np.float32, copy=False),
-                res.focal_2d_render.astype(np.float32, copy=False),
-                res.molecules, res.cells_3d)
 
     def _consume(k, bbox, dapi_zstack, focal_tile_full, mol, c3d):
         nonlocal all_molecules, all_cells_3d, seen_cell_ids
