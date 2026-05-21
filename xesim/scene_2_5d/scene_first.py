@@ -79,7 +79,10 @@ def precompute_scene_25d(
         print(f"[scene_first] precompute over {xmin:.0f}-{xmax:.0f}, "
               f"{ymin:.0f}-{ymax:.0f} µm")
 
-    z_attrs = load_or_fit_cells_z(bundle_path)
+    # Scope the z-fit to the scene bounds (+halo): a sub-region stitch fits
+    # only its region; a whole-bundle scene spans the full FOV → fits (+ marks)
+    # the whole bundle. A complete cache is used as-is.
+    z_attrs = load_or_fit_cells_z(bundle_path, region_um=scene_bounds_um, halo_um=25.0)
     if annotation_path is None:
         cand = Path(bundle_path).parent / "annotations" / "annotation.csv.gz"
         if cand.exists():

@@ -12,6 +12,7 @@ caches.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -25,6 +26,49 @@ def bundle_z_attrs_dir(bundle_path: str | Path) -> Path:
 
 def cells_z_path(bundle_path: str | Path) -> Path:
     return bundle_z_attrs_dir(bundle_path) / "cells_z.parquet"
+
+
+def _state_path(bundle_path: str | Path) -> Path:
+    return bundle_z_attrs_dir(bundle_path) / "cells_z.state"
+
+
+def _cache_state(bundle_path: str | Path) -> str | None:
+    """'complete' | 'partial' | None. A legacy cache (parquet present, no
+    state file) predates region-scoped fitting and is treated as complete —
+    it could only have come from the old whole-bundle fit."""
+    sp = _state_path(bundle_path)
+    if sp.exists():
+        s = sp.read_text().strip()
+        return s if s in ("complete", "partial") else None
+    return "complete" if cells_z_path(bundle_path).exists() else None
+
+
+def _set_state(bundle_path: str | Path, state: str) -> None:
+    sp = _state_path(bundle_path)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(state)
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    tmp = path.with_suffix(".parquet.tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def _merge_into_cache(out_path: Path, df_new: pd.DataFrame) -> pd.DataFrame:
+    """Union a region fit into the existing cache (new fits win for shared
+    cell_ids), atomically. Returns the merged frame."""
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
+        merged = pd.concat(
+            [existing[~existing["cell_id"].isin(df_new["cell_id"])], df_new],
+            ignore_index=True)
+    else:
+        merged = df_new
+    merged = merged.sort_values("cell_id").reset_index(drop=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_parquet(merged, out_path)
+    return merged
 
 
 def load_cells_z(bundle_path: str | Path) -> pd.DataFrame | None:
@@ -43,6 +87,8 @@ def fit_bundle_cells_z(
     overwrite: bool = False,
     progress: bool = True,
     num_workers: int = 8,
+    bounds_um: tuple[float, float, float, float] | None = None,
+    halo_um: float = 25.0,
 ) -> pd.DataFrame:
     """Fit per-cell z attributes over the whole bundle in tiles and
     write to ``<bundle_parent>/_xesim_z_attrs/cells_z.parquet``.
@@ -64,7 +110,9 @@ def fit_bundle_cells_z(
     from ..models import CropBox
 
     out_path = cells_z_path(bundle_path)
-    if out_path.exists() and not overwrite:
+    # Whole-bundle short-circuit only: a region fit always (re-)fits its
+    # region and merges, so it must not early-return on cache presence.
+    if bounds_um is None and out_path.exists() and not overwrite:
         if progress:
             print(f"[fit_bundle_cells_z] {out_path} exists; loading.")
         return pd.read_parquet(out_path)
@@ -80,20 +128,32 @@ def fit_bundle_cells_z(
     x_max = w_full * psz
     y_max = h_full * psz
 
-    # Tile grid (with overlap so cells near tile borders still get one
-    # tile that contains their full nucleus)
+    # Grid extent: whole FOV, or just the requested region expanded by a halo
+    # (so a small --tile/--region preview doesn't pay to fit the whole bundle;
+    # the per-cell z-fit has no cross-cell coupling, so a region fit gives the
+    # same per-cell results — the halo ensures edge cells get full footprints).
+    if bounds_um is None:
+        gx0, gy0, gx1, gy1 = 0.0, 0.0, x_max, y_max
+    else:
+        bx0, by0, bx1, by1 = bounds_um
+        gx0, gy0 = max(0.0, bx0 - halo_um), max(0.0, by0 - halo_um)
+        gx1, gy1 = min(x_max, bx1 + halo_um), min(y_max, by1 + halo_um)
+    # A region that spans the whole FOV is a complete fit (e.g. a whole-bundle
+    # request passed as explicit bounds), so it still earns the 'complete' mark.
+    covers_full = (gx0 <= 0.0 and gy0 <= 0.0 and gx1 >= x_max and gy1 >= y_max)
     step = tile_um - overlap_um
-    xs = list(np.arange(0.0, x_max, step))
-    ys = list(np.arange(0.0, y_max, step))
+    xs = list(np.arange(gx0, gx1, step)) or [gx0]
+    ys = list(np.arange(gy0, gy1, step)) or [gy0]
     grid = [(x, y) for y in ys for x in xs]
     if progress:
-        print(f"[fit_bundle_cells_z] bundle FOV {x_max:.0f}×{y_max:.0f} µm, "
+        scope = "whole bundle" if bounds_um is None else "region"
+        print(f"[fit_bundle_cells_z] {scope} {gx0:.0f}-{gx1:.0f}×{gy0:.0f}-{gy1:.0f} µm, "
               f"{len(grid)} tiles of {tile_um:.0f} µm")
 
     def _fit_one_tile(k_xy):
         k, (x0, y0) = k_xy
-        x1 = min(x0 + tile_um, x_max)
-        y1 = min(y0 + tile_um, y_max)
+        x1 = min(x0 + tile_um, gx1)
+        y1 = min(y0 + tile_um, gy1)
         if x1 - x0 < 2.0 or y1 - y0 < 2.0:
             return []
         crop = CropBox(xmin=x0, xmax=x1, ymin=y0, ymax=y1, crop_id=f"zfit_{k}")
@@ -181,26 +241,51 @@ def fit_bundle_cells_z(
     df = pd.DataFrame(rows).sort_values("cell_id").reset_index(drop=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out_path, index=False)
+    if bounds_um is None or covers_full:
+        # Whole-bundle (or full-FOV region) fit → authoritative cache + marker.
+        _atomic_write_parquet(df, out_path)
+        _set_state(bundle_path, "complete")
+        if progress:
+            print(f"[fit_bundle_cells_z] wrote {out_path}: {len(df)} cells (complete)")
+        return df
+    # Region fit → merge into any existing cache; mark partial so a later
+    # whole-bundle request knows to (re)fit the rest.
+    merged = _merge_into_cache(out_path, df)
+    _set_state(bundle_path, "partial")
     if progress:
-        print(f"[fit_bundle_cells_z] wrote {out_path}: {len(df)} cells")
+        print(f"[fit_bundle_cells_z] merged {len(df)} region cells; "
+              f"cache now {len(merged)} (partial)")
     return df
 
 
 def load_or_fit_cells_z(
     bundle_path: str | Path,
     *,
+    region_um: tuple[float, float, float, float] | None = None,
+    halo_um: float = 25.0,
     fit_kwargs: dict | None = None,
 ) -> pd.DataFrame:
     """Load cached cells_z.parquet if present; otherwise fit and write.
 
+    When ``region_um`` is given (a small --tile/--region preview), and no
+    COMPLETE cache exists, fit only that region (+halo) and merge — so a
+    preview doesn't trigger a whole-bundle fit (10-15 min on first touch).
+    A complete cache covers any region, so it's used as-is. ``region_um=None``
+    (whole-bundle / scene-first precompute) fits/uses the whole bundle.
+
     Returns DataFrame with columns [cell_id, z_center_um, z_extent_um,
     z_confidence].
     """
-    df = load_cells_z(bundle_path)
-    if df is not None:
-        return df
-    return fit_bundle_cells_z(bundle_path, **(fit_kwargs or {}))
+    fit_kwargs = fit_kwargs or {}
+    state = _cache_state(bundle_path)
+    if state == "complete":
+        df = load_cells_z(bundle_path)
+        if df is not None:
+            return df
+    if region_um is None:
+        return fit_bundle_cells_z(bundle_path, **fit_kwargs)
+    return fit_bundle_cells_z(bundle_path, bounds_um=tuple(region_um),
+                              halo_um=halo_um, **fit_kwargs)
 
 
 __all__ = [
