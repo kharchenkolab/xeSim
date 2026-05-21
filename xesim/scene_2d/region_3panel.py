@@ -36,28 +36,34 @@ def _load_bundle_morphology(synth_dir: Path, channel_names, bounds, psz,
     """
     import tifffile
     from .render_tile import bundle_origin_um
+    from ..images import _read_plane_region
 
     paths = sorted((synth_dir / "morphology_focus").glob("*.ome.tif"))
     H = int(round((bounds[3] - bounds[1]) / psz))
     W = int(round((bounds[2] - bounds[0]) / psz))
     ox, oy = bundle_origin_um(synth_dir)
-    y0 = int(round((bounds[1] - oy) / psz))
-    x0 = int(round((bounds[0] - ox) / psz))
+    y0 = max(0, int(round((bounds[1] - oy) / psz)))
+    x0 = max(0, int(round((bounds[0] - ox) / psz)))
     lut_channels = (display_lut or {}).get("channels", []) if display_lut else []
-    # Xenium-style OME: file 0 reads as (C, H, W) via cross-refs; older
-    # layout: one single-channel file per channel.
-    a0 = tifffile.imread(paths[0]).astype(np.float32)
-    if a0.ndim == 3:
-        planes = [a0[ci] for ci in range(min(len(channel_names), a0.shape[0]))]
+    n_ch = len(channel_names)
+    # Read ONLY the region, not the whole synth plane. A full-bundle synth
+    # morphology is ~60 GB across 4 channels; A3 runs per-region, so full
+    # imreads here were the diagnostics RAM hog (94 GB sequential, OOM in
+    # parallel). _read_plane_region decodes only the bbox tiles.
+    with tifffile.TiffFile(paths[0]) as tf:
+        multichannel_single = len(paths) == 1 and (tf.pages[0].ndim == 3
+                                                    or len(tf.pages) > 1)
+    if multichannel_single:
+        # Legacy single multichannel file — full read + slice (rare).
+        a0 = tifffile.imread(paths[0]).astype(np.float32)
+        planes = ([a0[ci] for ci in range(min(n_ch, a0.shape[0]))]
+                  if a0.ndim == 3 else [a0])
+        planes = [p[y0:y0 + H, x0:x0 + W] for p in planes]
     else:
-        planes = [tifffile.imread(p).astype(np.float32)
-                  for p in paths[:len(channel_names)]]
-        planes = [a if a.ndim == 2 else a[a.shape[0] // 2] for a in planes]
+        planes = [_read_plane_region(p, y0, y0 + H, x0, x0 + W).astype(np.float32)
+                  for p in paths[:n_ch]]
     imgs = []
-    for ci, img in enumerate(planes):
-        ly0 = max(0, min(y0, img.shape[0]))
-        lx0 = max(0, min(x0, img.shape[1]))
-        crop = img[ly0:ly0 + H, lx0:lx0 + W]
+    for ci, crop in enumerate(planes):
         if ci < len(lut_channels):
             lo = float(lut_channels[ci].get("lo", 0.0))
             hi = float(lut_channels[ci].get("hi", 1.0))
