@@ -240,7 +240,8 @@ STANDARD_REGIONS: list[tuple[tuple[float, float, float, float], str]] = [
 
 def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
                             model_dir: str | Path, out_dir: Path,
-                            regions: list = None) -> list[Path]:
+                            regions: list = None,
+                            workers: int | None = None) -> list[Path]:
     """Produce the standard explain diagnostic set:
 
       A1.  Whole-bundle thumbnail (real vs synth, low-res morphology pyramid).
@@ -286,38 +287,61 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
                 kept.append(((bx0, by0, min(x1b, bx0 + s), min(y1b, by0 + s)), lab))
         regions = kept
 
+    # Each panel is independent and writes its own PNG(s), so they run in
+    # parallel across processes. A spawn pool keeps matplotlib state per
+    # process (Agg, no shared pyplot races) and contains a panel crash/OOM
+    # to its own worker — the rest still complete (the failure mode that
+    # silently truncated earlier whole-bundle runs). A3 owns the only GPU
+    # task (one model.render subprocess); everything else is CPU/IO.
+    tasks = [
+        (_plot_whole_bundle_thumbnail,
+         (bundle_path, synth_dir, model_dir, out_dir, scene_bounds), {}),
+        (_plot_midscale_regions,
+         (bundle_path, synth_dir, model_dir, out_dir, scene_bounds), {}),
+        (_plot_tile_3panels,
+         (bundle_path, synth_dir, model_dir, out_dir, regions), {}),
+        (_plot_cell_level_grid,
+         (bundle_path, synth_dir, model_dir, out_dir), {"scene_bounds": scene_bounds}),
+        (_plot_celltype_breakdown, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_per_cell_distributions, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_type_resolution_breakdown, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_per_gene_scatter, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_intensity_histograms,
+         (bundle_path, synth_dir, model_dir, out_dir),
+         {"scene_bounds": scene_bounds}),
+    ]
+
+    def _norm(res):
+        if res is None:
+            return []
+        if isinstance(res, (list, tuple)):
+            return [p for p in res if p is not None]
+        return [res]
+
+    import os
+    n = workers if workers is not None else min(len(tasks), max(2, (os.cpu_count() or 4)))
+    n = max(1, min(n, len(tasks)))
+
     written: list[Path] = []
-    def _add(p):
-        if p is not None: written.append(p)
+    if n > 1:
+        try:
+            import multiprocessing as _mp
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            ctx = _mp.get_context("spawn")
+            print(f"[diagnostics] running {len(tasks)} panels on {n} workers",
+                  file=sys.stderr)
+            with ProcessPoolExecutor(max_workers=n, mp_context=ctx) as ex:
+                futs = [ex.submit(_safe, fn, *a, **kw) for fn, a, kw in tasks]
+                for f in as_completed(futs):
+                    written.extend(_norm(f.result()))
+            return written
+        except Exception as e:
+            print(f"[diagnostics] parallel pool failed ({e}); "
+                  f"falling back to sequential", file=sys.stderr)
+            written = []
 
-    # A. Real vs render across scales (scope-aware)
-    _add(_safe(_plot_whole_bundle_thumbnail, bundle_path, synth_dir,
-                  model_dir, out_dir, scene_bounds))
-    for p in _safe(_plot_midscale_regions, bundle_path, synth_dir,
-                       model_dir, out_dir, scene_bounds) or []:
-        _add(p)
-    for p in _safe(_plot_tile_3panels, bundle_path, synth_dir, model_dir,
-                       out_dir, regions) or []:
-        _add(p)
-    _add(_safe(_plot_cell_level_grid, bundle_path, synth_dir, model_dir,
-                  out_dir, scene_bounds=scene_bounds))
-
-    # B. Population stats
-    _add(_safe(_plot_celltype_breakdown, bundle_path, synth_dir, out_dir))
-    _add(_safe(_plot_per_cell_distributions, bundle_path, synth_dir, out_dir))
-
-    # T. Cell-type resolution provenance (skipped silently on bundles
-    # written by pre-resolver-refactor xesim that don't have the
-    # cell_type_source column).
-    _add(_safe(_plot_type_resolution_breakdown, bundle_path, synth_dir, out_dir))
-
-    # C. Transcript level
-    _add(_safe(_plot_per_gene_scatter, bundle_path, synth_dir, out_dir))
-
-    # D. Intensity
-    _add(_safe(_plot_intensity_histograms, bundle_path, synth_dir,
-                  model_dir, out_dir))
-
+    for fn, a, kw in tasks:
+        written.extend(_norm(_safe(fn, *a, **kw)))
     return written
 
 
@@ -1150,14 +1174,17 @@ def _plot_type_resolution_breakdown(bundle_path: Path, synth_dir: Path,
 
 def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
                                      model_dir: Path, out_dir: Path,
-                                     region: tuple = (1750, 1300, 2240, 1790)
-                                     ) -> Path:
+                                     region: tuple | None = None,
+                                     scene_bounds=None,
+                                     win_um: float = 490.0) -> Path:
     """D10: per-channel pixel-intensity histograms, real vs synth, log-y.
-    Sampled at a single tile-scale region (the ductal bench)."""
+    Sampled at a single, deterministic, cell-dense tile-scale window WITHIN
+    the rendered scope (so it works for region bundles + any tissue, and
+    re-running the same crop picks the same window)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import tifffile
+    import pandas as pd
     import json as _j
 
     out = Path(out_dir) / "stats_D10_intensity_histograms.png"
@@ -1167,7 +1194,33 @@ def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
             "pixel_size", 0.2125))
     except Exception:
         pass
-    xmin, ymin, xmax, ymax = region
+    # Pick a deterministic, cell-dense window within scope (densest of a
+    # coarse in-scope grid; ties broken by position → reproducible). Falls
+    # back to an explicit `region` if given.
+    if region is None:
+        cr = pd.read_parquet(bundle_path / "cells.parquet",
+                             columns=["x_centroid", "y_centroid"])
+        cx0, cx1 = cr.x_centroid.min(), cr.x_centroid.max()
+        cy0, cy1 = cr.y_centroid.min(), cr.y_centroid.max()
+        if scene_bounds is not None:
+            cx0 = max(cx0, scene_bounds[0]); cy0 = max(cy0, scene_bounds[1])
+            cx1 = min(cx1, scene_bounds[2]); cy1 = min(cy1, scene_bounds[3])
+        side = float(min(win_um, 0.8 * min(cx1 - cx0, cy1 - cy0)))
+        if side <= 0:
+            return _skip("D10", f"no in-scope area for {_scope_label(scene_bounds)}")
+        best = None
+        for x0 in np.linspace(cx0, cx1 - side, 6):
+            for y0 in np.linspace(cy0, cy1 - side, 6):
+                n = int(((cr.x_centroid >= x0) & (cr.x_centroid < x0 + side) &
+                         (cr.y_centroid >= y0) & (cr.y_centroid < y0 + side)).sum())
+                if best is None or n > best[0]:
+                    best = (n, float(x0), float(y0))
+        if best is None or best[0] == 0:
+            return _skip("D10", f"no in-scope cell-dense window for "
+                         f"{_scope_label(scene_bounds)}")
+        xmin, ymin, xmax, ymax = best[1], best[2], best[1] + side, best[2] + side
+    else:
+        xmin, ymin, xmax, ymax = region
     # Bounded reads — avoid loading multi-GB full morphology to RAM
     # (24.5 GB on the breast 5K bundle; full load OOMs).
     from .scene_2d.render_tile import real_tile_image
@@ -1177,7 +1230,8 @@ def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
     synth = real_tile_image(str(synth_dir),
         tile_bounds_um=bounds, pixel_size_um=psz)
     if real is None or synth is None:
-        return out
+        return _skip("D10", f"morphology region {bounds} not readable "
+                     f"({_scope_label(scene_bounds)})")
     h = min(real.shape[1], synth.shape[1]); w = min(real.shape[2], synth.shape[2])
     real = real[:, :h, :w]; synth = synth[:, :h, :w]
 
@@ -1208,8 +1262,9 @@ def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
         if ci == 0: axes[ci].set_ylabel("density (log)")
         axes[ci].legend(fontsize=8); axes[ci].grid(alpha=0.25, which="both")
     fig.suptitle(
-        f"D10. Per-channel intensity histograms — ductal bench region "
-        f"({int(xmax-xmin)}×{int(ymax-ymin)} µm)",
+        f"D10. Per-channel intensity histograms — {int(xmax-xmin)}×"
+        f"{int(ymax-ymin)} µm window @ ({int(xmin)},{int(ymin)}) "
+        f"[{_scope_label(scene_bounds)}]",
         fontsize=11, fontweight="bold")
     plt.tight_layout(rect=(0, 0, 1, 0.95))
     plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
