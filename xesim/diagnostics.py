@@ -51,6 +51,33 @@ def _safe(fn, *args, **kwargs):
         return None
 
 
+def _skip(panel: str, reason: str):
+    """Log a panel skip with its reason and return None. A panel must NEVER
+    silently vanish or emit a blank figure — empty selection, a missing
+    helper/input/annotation, or out-of-scope all log here and return None."""
+    print(f"[diagnostics] {panel} skipped: {reason}", file=sys.stderr)
+    return None
+
+
+def _scope_label(scene_bounds) -> str:
+    """Human-readable scope tag for panel titles, e.g.
+    'region 1500×1000µm @ (5000,500)' or 'whole bundle'."""
+    if scene_bounds is None:
+        return "whole bundle"
+    x0, y0, x1, y1 = scene_bounds
+    return f"region {x1-x0:.0f}×{y1-y0:.0f}µm @ ({x0:.0f},{y0:.0f})"
+
+
+def _is_region(scene_bounds, full_bounds_xy) -> bool:
+    """True if scene_bounds is a strict sub-window of the real bundle's
+    full extent (so titles can say 'region' vs 'whole bundle')."""
+    if scene_bounds is None or full_bounds_xy is None:
+        return False
+    x0, y0, x1, y1 = scene_bounds
+    fx0, fy0, fx1, fy1 = full_bounds_xy
+    return (x0 > fx0 + 1 or y0 > fy0 + 1 or x1 < fx1 - 1 or y1 < fy1 - 1)
+
+
 # ---------------------------------------------------------------------------
 # Channel palette (matches scene_2d.realism_panel.CHANNEL_STYLE)
 
@@ -90,21 +117,6 @@ def _lut_normalize(arr_chw: np.ndarray, display_lut: dict) -> np.ndarray:
                 if (arr_chw[ci] > 0).any() else 1.0
             out[ci] = arr_chw[ci] / max(p99, 1e-6)
     return np.clip(out, 0, 1)
-
-
-def _synth_render_bounds(synth_dir, margin_um: float = 0.0):
-    """Rendered global-µm bounds (x0,y0,x1,y1) of a synth bundle, shrunk by
-    ``margin_um`` on each side so a crop of half-width ``margin_um`` anchored
-    inside still fits. Returns None if the bundle has no recorded bounds
-    (treat as unrestricted). A full-bundle render returns its full extent,
-    which naturally doesn't restrict in-bundle example selection (it only
-    trims a thin edge margin); a region render restricts to the region."""
-    from .scene_2d.render_tile import bundle_bounds_um
-    b = bundle_bounds_um(synth_dir)
-    if b is None:
-        return None
-    x0, y0, x1, y1 = b
-    return (x0 + margin_um, y0 + margin_um, x1 - margin_um, y1 - margin_um)
 
 
 # ---------------------------------------------------------------------------
@@ -251,14 +263,19 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     out_dir     = Path(out_dir)
     regions     = regions or STANDARD_REGIONS
 
-    # Restrict A3 bench regions to the synth bundle's rendered extent. A
-    # region explain bundle only covers part of the slide, so the global
-    # STANDARD_REGIONS would fall outside it (shifted / empty panels).
-    # Keep those that fit; if none do, synthesize a couple of in-bounds
-    # bench regions centered in the rendered area.
-    rb = _synth_render_bounds(synth_dir, margin_um=0.0)
-    if rb is not None:
-        x0b, y0b, x1b, y1b = rb
+    # Scope is a first-class input: read the synth bundle's rendered extent
+    # ONCE (single source of truth — bundle_bounds_um) and hand it to every
+    # panel, which gates example-selection against it and annotates its
+    # title with the bounds it used. None => whole bundle (no restriction).
+    from .scene_2d.render_tile import bundle_bounds_um
+    scene_bounds = bundle_bounds_um(synth_dir)
+    print(f"[diagnostics] scope: {_scope_label(scene_bounds)}", file=sys.stderr)
+
+    # Restrict A3 bench regions to the rendered extent (region bundles only
+    # cover part of the slide). Keep those that fit; if none do, synthesize
+    # in-bounds bench regions centered in the rendered area.
+    if scene_bounds is not None:
+        x0b, y0b, x1b, y1b = scene_bounds
         kept = [(b, lab) for (b, lab) in regions
                 if b[0] >= x0b and b[1] >= y0b and b[2] <= x1b and b[3] <= y1b]
         if not kept:
@@ -273,17 +290,17 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     def _add(p):
         if p is not None: written.append(p)
 
-    # A. Real vs render across scales
+    # A. Real vs render across scales (scope-aware)
     _add(_safe(_plot_whole_bundle_thumbnail, bundle_path, synth_dir,
-                  model_dir, out_dir))
+                  model_dir, out_dir, scene_bounds))
     for p in _safe(_plot_midscale_regions, bundle_path, synth_dir,
-                       model_dir, out_dir) or []:
+                       model_dir, out_dir, scene_bounds) or []:
         _add(p)
     for p in _safe(_plot_tile_3panels, bundle_path, synth_dir, model_dir,
                        out_dir, regions) or []:
         _add(p)
     _add(_safe(_plot_cell_level_grid, bundle_path, synth_dir, model_dir,
-                  out_dir))
+                  out_dir, scene_bounds=scene_bounds))
 
     # B. Population stats
     _add(_safe(_plot_celltype_breakdown, bundle_path, synth_dir, out_dir))
@@ -385,8 +402,10 @@ def _load_display_lut(model_dir: Path) -> dict | None:
 
 
 def _plot_whole_bundle_thumbnail(bundle_path: Path, synth_dir: Path,
-                                     model_dir: Path, out_dir: Path) -> Path:
-    """A1: whole-bundle morphology thumbnail, real vs synth, side by side."""
+                                     model_dir: Path, out_dir: Path,
+                                     scene_bounds=None) -> Path:
+    """A1: morphology thumbnail, real vs synth, side by side. For a region
+    bundle the real panel is cropped to the same rendered extent."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -397,14 +416,14 @@ def _plot_whole_bundle_thumbnail(bundle_path: Path, synth_dir: Path,
     real = _read_morph_lowres(bundle_path, pyramid_level=LVL)
     synth = _read_morph_synth_lowres(synth_dir, pyramid_level=LVL,
                                           n_ch=real.shape[0] if real is not None else 4)
-    if real is None or synth is None:
-        return out
+    if real is None:
+        return _skip("A1", f"real morphology not readable ({bundle_path})")
+    if synth is None:
+        return _skip("A1", f"synth morphology not readable ({synth_dir})")
     # For a region synth bundle, crop the real plane to the same rendered
     # extent so the two panels show the SAME area (else real-whole vs
-    # synth-region are misaligned). bundle_bounds_um is (0,0,W,H) for a full
-    # bundle → this is a no-op there.
-    from .scene_2d.render_tile import bundle_bounds_um
-    rb = bundle_bounds_um(synth_dir)
+    # synth-region are misaligned). scene_bounds is None for a full bundle.
+    rb = scene_bounds
     psz = 0.2125
     try:
         import json as _j
@@ -433,12 +452,11 @@ def _plot_whole_bundle_thumbnail(bundle_path: Path, synth_dir: Path,
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6), facecolor="white",
                               gridspec_kw={"wspace": 0.02})
+    scope = _scope_label(scene_bounds)
     axes[0].imshow(rgb_real)
-    axes[0].set_title(f"real — whole bundle thumbnail",
-                        fontsize=11, fontweight="bold")
+    axes[0].set_title(f"real — {scope}", fontsize=11, fontweight="bold")
     axes[1].imshow(rgb_synth)
-    axes[1].set_title(f"synth — whole bundle thumbnail",
-                        fontsize=11, fontweight="bold")
+    axes[1].set_title(f"synth — {scope}", fontsize=11, fontweight="bold")
     for a in axes: a.axis("off")
     plt.savefig(out, dpi=130, bbox_inches="tight", pad_inches=0.05,
                   facecolor="white")
@@ -448,8 +466,10 @@ def _plot_whole_bundle_thumbnail(bundle_path: Path, synth_dir: Path,
 
 def _plot_midscale_regions(bundle_path: Path, synth_dir: Path,
                                 model_dir: Path, out_dir: Path,
+                                scene_bounds=None,
                                 size_um: float = 1500.0) -> list[Path]:
-    """A2: 3 mid-scale regions (~1.5 mm) — real vs saved bundle at each."""
+    """A2: up to 3 mid-scale regions (~1.5 mm, smaller if the scene is) —
+    real vs saved bundle at each."""
     import pandas as pd
     import matplotlib
     matplotlib.use("Agg")
@@ -462,14 +482,19 @@ def _plot_midscale_regions(bundle_path: Path, synth_dir: Path,
                                       columns=["x_centroid", "y_centroid"])
     xmin, xmax = cells_real["x_centroid"].min(), cells_real["x_centroid"].max()
     ymin, ymax = cells_real["y_centroid"].min(), cells_real["y_centroid"].max()
-    # Clamp the scan to the synth bundle's rendered extent so region
-    # bundles only pick in-region windows (windows must fully fit).
-    rb = _synth_render_bounds(synth_dir, margin_um=0.0)
-    if rb is not None:
-        xmin = max(xmin, rb[0]); ymin = max(ymin, rb[1])
-        xmax = min(xmax, rb[2]); ymax = min(ymax, rb[3])
+    # Clamp the scan to the rendered extent so region bundles only pick
+    # in-region windows (windows must fully fit). scene_bounds=None => full.
+    if scene_bounds is not None:
+        xmin = max(xmin, scene_bounds[0]); ymin = max(ymin, scene_bounds[1])
+        xmax = min(xmax, scene_bounds[2]); ymax = min(ymax, scene_bounds[3])
+    # Adapt the window to the available extent so small regions still get a
+    # panel (use ~80% of the smaller side, capped at the default 1500 µm).
+    avail = min(xmax - xmin, ymax - ymin)
+    if avail <= 0:
+        return _skip("A2", f"no in-scope area for {_scope_label(scene_bounds)}")
+    size_um = float(min(size_um, 0.8 * avail))
     # Coarse grid scan
-    step = size_um / 2
+    step = max(size_um / 2, 1.0)
     candidates = []
     for x0 in np.arange(xmin, xmax - size_um + 1, step):
         for y0 in np.arange(ymin, ymax - size_um + 1, step):
@@ -486,6 +511,9 @@ def _plot_midscale_regions(bundle_path: Path, synth_dir: Path,
             chosen.append((n, x0, y0))
         if len(chosen) >= 3:
             break
+    if not chosen or chosen[0][0] == 0:
+        return _skip("A2", f"no in-bounds cell-dense window for "
+                     f"{_scope_label(scene_bounds)}")
 
     written = []
     psz = 0.2125
@@ -546,6 +574,11 @@ def _plot_tile_3panels(bundle_path: Path, synth_dir: Path, model_dir: Path,
     import subprocess
     diag_script = Path(__file__).resolve().parent.parent / "misc" / "diagnostics_region_3panel.py"
     if not diag_script.exists():
+        _skip("A3", f"render subprocess not found: {diag_script} "
+              "(gitignored; not present on clean checkouts)")
+        return []
+    if not regions:
+        _skip("A3", "no in-bounds bench regions for this scope")
         return []
     written = []
     for bounds, label in regions:
@@ -618,7 +651,8 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
                               n_regions: int = 12,
                               composition_window_um: float = 200.0,
                               min_spatial_dist_um: float = 300.0,
-                              cells_per_type: int | None = None) -> Path:
+                              cells_per_type: int | None = None,
+                              scene_bounds=None) -> Path:
     """A4: compositionally distinct cell-level regions (3-column layout).
 
     For up to ``n_regions`` cell types, pick a representative ~``crop_um``
@@ -646,32 +680,35 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
     # Anchor picks to the REAL bundle (deterministic across synth bundles)
     real_cells_path = bundle_path / "cells.parquet"
     if not real_cells_path.exists():
-        return out
+        return _skip("A4", f"real cells.parquet not found ({bundle_path})")
     real_cells = pd.read_parquet(
         real_cells_path, columns=["cell_id", "x_centroid", "y_centroid"])
     ann_df = _find_annotation(bundle_path, model_dir)
     if ann_df is None:
-        return out
+        return _skip("A4", "no cell-type annotation (annotation.csv[.gz]) found")
     cell_to_type = dict(zip(ann_df["cell_id"].astype(str),
                               ann_df["merged_annotation"].astype(str)))
     real_cells["cell_type"] = real_cells["cell_id"].astype(str).map(cell_to_type)
     gt = real_cells.dropna(subset=["cell_type"]).rename(
         columns={"x_centroid": "centroid_x", "y_centroid": "centroid_y"})
-    # Restrict candidate cells to the synth bundle's rendered extent so a
-    # region bundle picks in-region examples (crop fits) instead of empty
-    # out-of-region windows. Anchored to the real-cell ordering, so the
-    # same region/full always selects the same examples where they overlap.
-    rb = _synth_render_bounds(synth_dir, margin_um=crop_um / 2)
-    if rb is not None:
-        x0b, y0b, x1b, y1b = rb
+    # Restrict candidate cells to the rendered extent so a region bundle
+    # picks in-region examples (crop fits) instead of empty out-of-region
+    # windows. Anchored to the real-cell ordering, so the same region/full
+    # always selects the same examples where they overlap. scene_bounds is
+    # shrunk by crop_um/2 so the crop window fits; None => full bundle.
+    if scene_bounds is not None:
+        m = crop_um / 2
+        x0b, y0b, x1b, y1b = (scene_bounds[0] + m, scene_bounds[1] + m,
+                              scene_bounds[2] - m, scene_bounds[3] - m)
         gt = gt[(gt.centroid_x >= x0b) & (gt.centroid_x < x1b) &
                 (gt.centroid_y >= y0b) & (gt.centroid_y < y1b)]
         if len(gt) == 0:
-            return out
+            return _skip("A4", f"no in-bounds annotated cells for "
+                         f"{_scope_label(scene_bounds)}")
     types_used = [t for t in sorted(gt["cell_type"].dropna().unique())
                     if t.lower() != "unknown" and t.lower() != "ambiguous / low-quality"]
     if not types_used:
-        return out
+        return _skip("A4", "no usable cell types in scope")
 
     # For each candidate type, find up to K spatially-distinct windows
     # whose composition_window_um neighborhood is most enriched for that
@@ -721,7 +758,8 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
             break
     picks = picks[:n_regions]
     if not picks:
-        return out
+        return _skip("A4", f"no enriched in-bounds cell windows for "
+                     f"{_scope_label(scene_bounds)}")
 
     psz = 0.2125
     try:
@@ -813,7 +851,8 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
                   fontsize=8, frameon=True, bbox_to_anchor=(0.5, 0.0))
 
     fig.suptitle(f"A4. Composition-distinct regions — "
-                    f"{int(crop_um)}×{int(crop_um)} µm cell-scale crops",
+                    f"{int(crop_um)}×{int(crop_um)} µm cell-scale crops "
+                    f"[{_scope_label(scene_bounds)}]",
                     fontsize=11, fontweight="bold", y=0.998)
     plt.subplots_adjust(left=0.13, right=1.0, top=0.97, bottom=0.06)
     plt.savefig(out, dpi=130, bbox_inches="tight", pad_inches=0.02,
