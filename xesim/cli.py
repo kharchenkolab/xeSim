@@ -1079,7 +1079,10 @@ def build_parser() -> argparse.ArgumentParser:
               "(A1-A4 morphology grids, B-D population panels).")
     de.add_argument("synth", help="path to a synth bundle (xesim explain output)")
     de.add_argument("--bundle", required=True, help="real Xenium bundle to compare against")
-    de.add_argument("--model", required=True, help="fitted MODEL_DIR used to render the synth bundle")
+    de.add_argument("--model", default=None,
+                    help="MODEL_DIR override. Default: read from the synth "
+                         "bundle's synth_metadata.model_dir (the model that "
+                         "rendered it — the matched model+LUT for the panels).")
     de.add_argument("--out", default=None,
                        help="output dir (default: SYNTH/diagnostics/)")
     de.set_defaults(func=_diagnostics_explain)

@@ -352,8 +352,38 @@ def load_regions_file(path) -> list[tuple[tuple[float, float, float, float], str
     return out
 
 
+def _resolve_diagnostic_model(synth_dir: Path, model_dir) -> Path:
+    """Resolve the model for the render-based panels (A3).
+
+    A synth bundle and the display LUT of the model that wrote it are a matched
+    pair — rendering or LUT-normalizing with a *different* model corrupts the
+    comparison (this is exactly what produced a spurious breast A3 mismatch).
+    Prefer the model recorded in the bundle's ``synth_metadata.model_dir``; an
+    explicit ``model_dir`` overrides it (warning on mismatch)."""
+    recorded = None
+    try:
+        meta = json.loads((Path(synth_dir) / "experiment.xenium").read_text())
+        recorded = (meta.get("synth_metadata") or {}).get("model_dir")
+    except Exception:
+        pass
+    if model_dir is not None:
+        if recorded and str(recorded) != str(model_dir):
+            print(f"[diagnostics] model OVERRIDE: using {model_dir} — but the "
+                  f"bundle records model_dir={recorded}; panels 1-3 may not "
+                  f"match the saved bundle (panel 4).", file=sys.stderr)
+        return Path(model_dir)
+    if recorded and Path(recorded).exists():
+        print(f"[diagnostics] model (from bundle synth_metadata): {recorded}",
+              file=sys.stderr)
+        return Path(recorded)
+    raise ValueError(
+        f"No model given and none usable in {synth_dir}/experiment.xenium "
+        f"synth_metadata.model_dir (recorded={recorded!r}). Pass an explicit model.")
+
+
 def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
-                            model_dir: str | Path, out_dir: Path,
+                            model_dir: str | Path | None = None,
+                            out_dir: Path = None,
                             regions: list = None,
                             workers: int | None = None) -> list[Path]:
     """Produce the standard explain diagnostic set:
@@ -374,7 +404,7 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     """
     bundle_path = Path(bundle_path)
     synth_dir   = Path(synth_dir)
-    model_dir   = Path(model_dir)
+    model_dir   = _resolve_diagnostic_model(synth_dir, model_dir)
     out_dir     = Path(out_dir)
 
     # Scope is a first-class input: read the synth bundle's rendered extent
