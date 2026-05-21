@@ -92,6 +92,21 @@ def _lut_normalize(arr_chw: np.ndarray, display_lut: dict) -> np.ndarray:
     return np.clip(out, 0, 1)
 
 
+def _synth_render_bounds(synth_dir, margin_um: float = 0.0):
+    """Rendered global-µm bounds (x0,y0,x1,y1) of a synth bundle, shrunk by
+    ``margin_um`` on each side so a crop of half-width ``margin_um`` anchored
+    inside still fits. Returns None if the bundle has no recorded bounds
+    (treat as unrestricted). A full-bundle render returns its full extent,
+    which naturally doesn't restrict in-bundle example selection (it only
+    trims a thin edge margin); a region render restricts to the region."""
+    from .scene_2d.render_tile import bundle_bounds_um
+    b = bundle_bounds_um(synth_dir)
+    if b is None:
+        return None
+    x0, y0, x1, y1 = b
+    return (x0 + margin_um, y0 + margin_um, x1 - margin_um, y1 - margin_um)
+
+
 # ---------------------------------------------------------------------------
 # fit-model diagnostics
 
@@ -236,6 +251,24 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     out_dir     = Path(out_dir)
     regions     = regions or STANDARD_REGIONS
 
+    # Restrict A3 bench regions to the synth bundle's rendered extent. A
+    # region explain bundle only covers part of the slide, so the global
+    # STANDARD_REGIONS would fall outside it (shifted / empty panels).
+    # Keep those that fit; if none do, synthesize a couple of in-bounds
+    # bench regions centered in the rendered area.
+    rb = _synth_render_bounds(synth_dir, margin_um=0.0)
+    if rb is not None:
+        x0b, y0b, x1b, y1b = rb
+        kept = [(b, lab) for (b, lab) in regions
+                if b[0] >= x0b and b[1] >= y0b and b[2] <= x1b and b[3] <= y1b]
+        if not kept:
+            cx, cy = 0.5 * (x0b + x1b), 0.5 * (y0b + y1b)
+            for s, lab in ((300.0, "region_center"), (490.0, "region_wide")):
+                h = s / 2
+                bx0, by0 = max(x0b, cx - h), max(y0b, cy - h)
+                kept.append(((bx0, by0, min(x1b, bx0 + s), min(y1b, by0 + s)), lab))
+        regions = kept
+
     written: list[Path] = []
     def _add(p):
         if p is not None: written.append(p)
@@ -360,11 +393,30 @@ def _plot_whole_bundle_thumbnail(bundle_path: Path, synth_dir: Path,
 
     out = Path(out_dir) / "scale_A1_whole_bundle.png"
     lut = _load_display_lut(model_dir)
-    real = _read_morph_lowres(bundle_path, pyramid_level=5)
-    synth = _read_morph_synth_lowres(synth_dir, pyramid_level=5,
+    LVL = 5
+    real = _read_morph_lowres(bundle_path, pyramid_level=LVL)
+    synth = _read_morph_synth_lowres(synth_dir, pyramid_level=LVL,
                                           n_ch=real.shape[0] if real is not None else 4)
     if real is None or synth is None:
         return out
+    # For a region synth bundle, crop the real plane to the same rendered
+    # extent so the two panels show the SAME area (else real-whole vs
+    # synth-region are misaligned). bundle_bounds_um is (0,0,W,H) for a full
+    # bundle → this is a no-op there.
+    from .scene_2d.render_tile import bundle_bounds_um
+    rb = bundle_bounds_um(synth_dir)
+    psz = 0.2125
+    try:
+        import json as _j
+        psz = float(_j.load(open(model_dir / "manifest.json")).get("pixel_size", 0.2125))
+    except Exception:
+        pass
+    if rb is not None:
+        sc = psz * (2 ** LVL)
+        ry0, ry1 = int(rb[1] / sc), int(round(rb[3] / sc))
+        rx0, rx1 = int(rb[0] / sc), int(round(rb[2] / sc))
+        ry1 = max(ry1, ry0 + 1); rx1 = max(rx1, rx0 + 1)
+        real = real[:, ry0:min(ry1, real.shape[1]), rx0:min(rx1, real.shape[2])]
     # Match sizes
     h = min(real.shape[1], synth.shape[1]); w = min(real.shape[2], synth.shape[2])
     real = real[:, :h, :w]; synth = synth[:, :h, :w]
@@ -410,6 +462,12 @@ def _plot_midscale_regions(bundle_path: Path, synth_dir: Path,
                                       columns=["x_centroid", "y_centroid"])
     xmin, xmax = cells_real["x_centroid"].min(), cells_real["x_centroid"].max()
     ymin, ymax = cells_real["y_centroid"].min(), cells_real["y_centroid"].max()
+    # Clamp the scan to the synth bundle's rendered extent so region
+    # bundles only pick in-region windows (windows must fully fit).
+    rb = _synth_render_bounds(synth_dir, margin_um=0.0)
+    if rb is not None:
+        xmin = max(xmin, rb[0]); ymin = max(ymin, rb[1])
+        xmax = min(xmax, rb[2]); ymax = min(ymax, rb[3])
     # Coarse grid scan
     step = size_um / 2
     candidates = []
@@ -599,6 +657,17 @@ def _plot_cell_level_grid(bundle_path: Path, synth_dir: Path,
     real_cells["cell_type"] = real_cells["cell_id"].astype(str).map(cell_to_type)
     gt = real_cells.dropna(subset=["cell_type"]).rename(
         columns={"x_centroid": "centroid_x", "y_centroid": "centroid_y"})
+    # Restrict candidate cells to the synth bundle's rendered extent so a
+    # region bundle picks in-region examples (crop fits) instead of empty
+    # out-of-region windows. Anchored to the real-cell ordering, so the
+    # same region/full always selects the same examples where they overlap.
+    rb = _synth_render_bounds(synth_dir, margin_um=crop_um / 2)
+    if rb is not None:
+        x0b, y0b, x1b, y1b = rb
+        gt = gt[(gt.centroid_x >= x0b) & (gt.centroid_x < x1b) &
+                (gt.centroid_y >= y0b) & (gt.centroid_y < y1b)]
+        if len(gt) == 0:
+            return out
     types_used = [t for t in sorted(gt["cell_type"].dropna().unique())
                     if t.lower() != "unknown" and t.lower() != "ambiguous / low-quality"]
     if not types_used:
