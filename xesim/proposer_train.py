@@ -76,7 +76,7 @@ class TinyProposerUNet(nn.Module):
 
 @dataclass
 class _CorpusSplit(Dataset):
-    inputs: np.ndarray  # (N, 4, H, W) float16
+    inputs: np.ndarray  # (N, 4, H, W) float32 (ch0-1 continuous intensities)
     present: np.ndarray  # (N, H, W) uint8
     offsets: np.ndarray  # (N, 2, H, W) float16
     type_idx: np.ndarray  # (N, H, W) uint8

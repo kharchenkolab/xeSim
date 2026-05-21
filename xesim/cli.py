@@ -358,9 +358,15 @@ def _explain_25d(args: argparse.Namespace) -> None:
     else:
         raise SystemExit("--scene-mode 2.5d requires --tile, --region, or --whole-bundle")
 
-    # Resolve intensity calibration for non-DAPI channels
-    target_intensity_stats, _, calib_mode = _resolve_intensity_calibration(
-        args.intensity_calibration, args.bundle, model)
+    # Resolve calibration via the shared single source of truth (same config
+    # the 2D path uses: display LUT + per-channel sensor noise + histmatch/
+    # scale targets), so the 2.5D focal-plane morphology is calibrated exactly
+    # like the 2D bundle writer instead of a parallel, noise-free reimplementation.
+    from .scene_2d.render_region import resolve_render_calibration
+    _calib = resolve_render_calibration(
+        model, args.bundle, model_dir=args.model, mode=args.intensity_calibration)
+    target_intensity_stats = _calib["target_stats"]
+    calib_mode = _calib["mode"]
 
     if use_stitch:
         stitch_tile_um = float(args.stitch_tile_um)
@@ -415,7 +421,10 @@ def _explain_25d(args: argparse.Namespace) -> None:
         real_bundle_path=args.bundle,
         config=cfg, overwrite=args.overwrite,
         target_intensity_stats=target_intensity_stats,
+        target_intensity_quantiles=_calib["target_quantiles"],
         intensity_mode=calib_mode,
+        display_lut=_calib["display_lut"],
+        model_dir=str(args.model),
     )
     import json
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
@@ -486,31 +495,32 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
     from .scene_2d.bundle_writer import write_bundle
     from .scene_2d.scene_pipeline import build_scene
 
+    from .scene_2d.render_region import resolve_render_calibration
     nf = _resolve_noise_fraction(args.noise_fraction, args.bundle)
-    target_intensity, target_quantiles, calib_mode = _resolve_intensity_calibration(
-        args.intensity_calibration, args.bundle, model)
+    # Single source of truth for calibration config (display LUT + per-channel
+    # sensor noise + histmatch/scale targets), shared with the diagnostics so
+    # the A3 panel reflects exactly what this path writes.
+    calib = resolve_render_calibration(
+        model, args.bundle, model_dir=args.model, mode=args.intensity_calibration)
+    target_intensity = calib["target_stats"]
+    target_quantiles = calib["target_quantiles"]
+    calib_mode = calib["mode"]
+    display_lut = calib["display_lut"]
+    if target_intensity is not None:
+        print(f"[explain] Intensity calibration '{calib_mode}' tuned from real bundle")
+    elif target_quantiles is not None:
+        print(f"[explain] Intensity calibration 'histmatch': "
+              f"{len(target_quantiles)} channel quantile tables")
+    if display_lut is not None and display_lut.get("noise_stats"):
+        print(f"[explain] calibrated noise: "
+              f"{[(n.get('read_std',0), n.get('shot_k',0)) for n in display_lut['noise_stats']]}")
 
     if args.scene_first:
         result = _explain_multi_scene_first(model, args, bounds, rng, nf,
                                                 target_intensity, target_quantiles, calib_mode)
     else:
-        # The streaming writer needs to know about display_lut +
-        # channel_names ahead of time, since it does in-line uint16
-        # calibration during tile finalize. Look those up up-front.
-        from .scene_2d.render_tile import load_model_display_lut
-        from .scene_2d.intensity import calibrate_noise_stats
-        _display_lut = load_model_display_lut(str(args.model))
-        if _display_lut is not None and args.bundle:
-            try:
-                import os as _os
-                if _os.environ.get("XESIM_DISABLE_NOISE", "").strip() == "1":
-                    _display_lut["noise_stats"] = []   # parity-test mode
-                else:
-                    _display_lut["noise_stats"] = calibrate_noise_stats(
-                        args.bundle, display_lut=_display_lut)
-            except Exception:
-                pass
-        _channel_names = list(model.manifest.get("channel_names") or [])
+        _channel_names = calib["channel_names"]
+        _display_lut = display_lut
         result = build_scene(
             model, args.bundle,
             scene_bounds_um=bounds,
@@ -566,29 +576,9 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
         "stamp_transcripts": bool(args.stamp_transcripts),
     }
 
-    # Pass the model's display LUT so the bundle writer maps renderer
-    # output → uint16 in the same intensity space the renderer was
-    # trained in (lut_native mode preserves channel ratios + matches
-    # real Xenium scale, instead of the lossy per-channel p99→4095).
-    # Also auto-calibrate per-channel noise (Gaussian read + Poisson shot)
-    # from the real bundle so synth's dark regions have the same noise
-    # texture as real (the deterministic renderer produces zero variance).
-    from .scene_2d.render_tile import load_model_display_lut
-    from .scene_2d.intensity import calibrate_noise_stats
-    display_lut = load_model_display_lut(str(args.model))
-    if display_lut is not None and args.bundle:
-        try:
-            import os as _os
-            if _os.environ.get("XESIM_DISABLE_NOISE", "").strip() == "1":
-                display_lut["noise_stats"] = []
-                print(f"[explain] noise injection disabled (XESIM_DISABLE_NOISE=1)")
-            else:
-                display_lut["noise_stats"] = calibrate_noise_stats(
-                    args.bundle, display_lut=display_lut)
-                print(f"[explain] calibrated noise: "
-                        f"{[(n.get('read_std',0), n.get('shot_k',0)) for n in display_lut['noise_stats']]}")
-        except Exception as e:
-            print(f"[explain] noise calibration unavailable ({e}); skipping noise injection")
+    # display_lut (LUT-native mapping + calibrated sensor noise) was resolved
+    # once up-front via resolve_render_calibration — reused here so the writer
+    # calibrates in the same space the streaming render did.
     print(f"[explain] Writing bundle → {args.out}")
     try:
         # When the streaming writer ran inside build_scene, the
@@ -614,6 +604,7 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
             real_bundle_path=args.bundle,
             display_lut=display_lut,
             geom_stash=result.get("geom_stash"),
+            model_dir=str(args.model),
         )
         if result.get("morphology_already_written"):
             written["morphology"] = {
@@ -635,13 +626,21 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
                        indent=2, default=str))
     if getattr(args, "diagnostic", None) is not None:
-        from .diagnostics import resolve_diagnostic_dir, explain_diagnostics
+        from .diagnostics import (resolve_diagnostic_dir, explain_diagnostics,
+                                  load_regions_file)
         diag_dir = resolve_diagnostic_dir(args.diagnostic, args.out)
+        regions = None
+        rfile = getattr(args, "diagnostic_regions", None)
+        if rfile:
+            regions = load_regions_file(rfile)
+            print(f"[explain] A3 regions from {rfile}: "
+                  f"{[lab for _, lab in regions]}")
         print(f"[explain] writing diagnostics → {diag_dir}")
         for p in explain_diagnostics(bundle_path=args.bundle,
                                           synth_dir=args.out,
                                           model_dir=args.model,
-                                          out_dir=diag_dir):
+                                          out_dir=diag_dir,
+                                          regions=regions):
             print(f"  {p}")
         # STpuppeteer-backend additions: stratified per-cell-type stats
         # + marker-specificity matrix. Only meaningful when the backend
@@ -687,6 +686,7 @@ def _write_bundle_single(model, args, scene, image, bounds, rng) -> None:
         target_intensity_quantiles=target_quantiles,
         intensity_mode=calib_mode,
         real_bundle_path=args.bundle,
+        model_dir=str(args.model),
     )
     print(f"[explain] Done.")
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
@@ -713,20 +713,19 @@ def _resolve_noise_fraction(arg_value, bundle_path):
 
 
 def _resolve_intensity_calibration(mode, bundle_path, model):
-    """Tune per-channel calibration stats for the chosen mode."""
-    from .scene_2d.bundle_writer import auto_tune_intensity_stats
-    from .scene_2d.intensity import auto_tune_intensity_quantiles
-    channel_names = list(model.manifest.get("channel_names") or [])
-    target_stats = None
-    target_quantiles = None
-    if mode in ("scale", "match2"):
-        target_stats = auto_tune_intensity_stats(bundle_path, channel_names)
-        stat_str = ", ".join(f"{n}: p50={p50:.0f} p99.5={p99:.0f}"
-                              for n, (p50, p99) in target_stats.items())
-        print(f"[explain] Intensity calibration '{mode}' tuned from real "
-              f"bundle: {stat_str}")
-    elif mode == "histmatch":
-        target_quantiles = auto_tune_intensity_quantiles(bundle_path, channel_names)
+    """Tune per-channel calibration targets for the chosen mode.
+
+    Thin wrapper over the shared resolve_render_calibration (single source of
+    truth) for callers that only need the targets, not the display LUT (the
+    single-tile path)."""
+    from .scene_2d.render_region import resolve_render_calibration
+    calib = resolve_render_calibration(model, bundle_path, model_dir=None, mode=mode)
+    target_stats, target_quantiles = calib["target_stats"], calib["target_quantiles"]
+    if target_stats is not None:
+        print(f"[explain] Intensity calibration '{mode}' tuned from real bundle: "
+              + ", ".join(f"{n}: p50={p50:.0f} p99.5={p99:.0f}"
+                          for n, (p50, p99) in target_stats.items()))
+    elif target_quantiles is not None:
         print(f"[explain] Intensity calibration 'histmatch': "
               f"tuned {len(target_quantiles)} channel quantile tables")
     else:
@@ -926,6 +925,11 @@ def build_parser() -> argparse.ArgumentParser:
     diag_parent.add_argument(
         "--no-diagnostic", dest="diagnostic", action="store_const", const=None,
         help="disable the default diagnostic output.")
+    diag_parent.add_argument(
+        "--diagnostic-regions", default=None, metavar="FILE",
+        help="explicit A3 bench regions (JSON list of {name,xmin,ymin,xmax,"
+             "ymax} or CSV name,xmin,ymin,xmax,ymax; global µm). Default: "
+             "diverse regions chosen automatically from the bundle's 10x cells.")
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1098,14 +1102,18 @@ def build_parser() -> argparse.ArgumentParser:
                             "present, else 1.0. Pancreas v21 ~1.18 closes "
                             "the per-tile boundary-loss gap. Override here.")
     exp.add_argument("--intensity-calibration",
-                       choices=["off", "scale", "match2", "histmatch",
-                                "lut_native", "lut_zerofloor"],
-                       default="off",
-                       help="per-channel brightness handling. "
-                            "off: per-render p99.5 → 4095 (viewer-friendly). "
-                            "scale: synth_p99.5 → real_bundle_p99.5. "
-                            "match2: 2-anchor (p50, p99.5). "
-                            "histmatch: full quantile remap.")
+                       choices=["lut_native", "lut_zerofloor", "scale",
+                                "match2", "histmatch", "none"],
+                       default="lut_native",
+                       help="renderer float → uint16 morphology mapping. "
+                            "LUT family (honest affine to real Xenium scale): "
+                            "lut_native [default] maps [0,1]→[lo,hi] preserving "
+                            "channel ratios + scale; lut_zerofloor maps →[0,hi]. "
+                            "target-stat family (linear, tuned to real): scale "
+                            "(synth_p99.5→real_p99.5), match2 (p50+p99.5). "
+                            "histmatch: non-linear per-channel quantile remap to "
+                            "real (masks renderer differences). none: raw fixed "
+                            "×4095 scale, no per-channel/LUT/stat adjustment.")
 
     # Misc
     exp.add_argument("--inference-tile-px", type=int, default=None,
@@ -1210,7 +1218,10 @@ def build_parser() -> argparse.ArgumentParser:
               "(A1-A4 morphology grids, B-D population panels).")
     de.add_argument("synth", help="path to a synth bundle (xesim explain output)")
     de.add_argument("--bundle", required=True, help="real Xenium bundle to compare against")
-    de.add_argument("--model", required=True, help="fitted MODEL_DIR used to render the synth bundle")
+    de.add_argument("--model", default=None,
+                    help="MODEL_DIR override. Default: read from the synth "
+                         "bundle's synth_metadata.model_dir (the model that "
+                         "rendered it — the matched model+LUT for the panels).")
     de.add_argument("--out", default=None,
                        help="output dir (default: SYNTH/diagnostics/)")
     de.set_defaults(func=_diagnostics_explain)

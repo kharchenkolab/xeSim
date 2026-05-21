@@ -136,7 +136,13 @@ def build_proposer_corpus(
                     if 0 < t <= n_types_minus1:
                         type_idx_map[cell_pix] = t
 
-            inputs_list.append(inp.astype(np.float16))  # halve input footprint too
+            # Keep inputs float32: channels 0–1 are continuous real-morphology
+            # intensities (DAPI / membrane); float16 (~10-bit mantissa) loses
+            # precision on them (esp. raw-uint16 values >2048). The trainer
+            # casts to float32 on load anyway, so this only affects stored
+            # fidelity, not loader cost. (Binary mask channels 2–3 are exact
+            # in float32 too; offsets below stay float16 — sub-pixel, harmless.)
+            inputs_list.append(inp.astype(np.float32))
             present_list.append(present)
             offsets_list.append(offsets)
             onehot_list.append(type_idx_map)
@@ -145,7 +151,7 @@ def build_proposer_corpus(
             rates_list.append(float(ablation_rate))
             n_ablated_list.append(int(n_ab))
 
-    inputs_arr = np.stack(inputs_list, axis=0)  # float16 (N, 4, H, W)
+    inputs_arr = np.stack(inputs_list, axis=0)  # float32 (N, 4, H, W)
     present_arr = np.stack(present_list, axis=0)  # uint8 (N, H, W)
     offsets_arr = np.stack(offsets_list, axis=0)  # float16 (N, 2, H, W)
     onehot_arr = np.stack(onehot_list, axis=0)  # uint8 (N, H, W)

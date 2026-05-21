@@ -231,16 +231,161 @@ def _plot_training_loss(training_log: Path, out_dir: Path) -> Path:
 # explain diagnostics — orchestrator
 
 
-# Tile-scale 3-panel bench regions (real | m.render | saved bundle)
-STANDARD_REGIONS: list[tuple[tuple[float, float, float, float], str]] = [
-    ((1750, 1300, 2240, 1790), "ductal_mixed"),
-    ((6289, 2018, 6779, 2508), "endocrine_islet"),
-]
+def select_bench_regions(
+    cells_df,
+    scene_bounds: tuple[float, float, float, float] | None = None,
+    n: int = 4,
+    size_um: float = 490.0,
+    min_cells: int = 25,
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Pick ``n`` diverse, bench-scale (``size_um`` square) regions for the A3
+    panel — deterministically, from 10x cell calls.
+
+    Stability: a pure function of the real cell centroids (no RNG), so the
+    same bundle + crop config yields the same regions every run. Diversity:
+    farthest-point sampling over standardized features
+    ``[center_x, center_y, log density, mean transcript_count, mean cell_area]``
+    seeded at the densest window — so the set spans both space and local
+    tissue regime (dense ↔ sparse, transcript/area variation). Labels are
+    tissue-neutral (``region1``…``regionN``, sorted densest→sparsest).
+
+    ``scene_bounds`` (global µm xmin,ymin,xmax,ymax) restricts candidates to a
+    region bundle's rendered extent; None ⇒ the full cell extent.
+    """
+    xs = np.asarray(cells_df["x_centroid"], dtype=float)
+    ys = np.asarray(cells_df["y_centroid"], dtype=float)
+    n_all = len(xs)
+    tx = np.asarray(
+        cells_df["transcript_counts"] if "transcript_counts" in cells_df
+        else cells_df["total_counts"] if "total_counts" in cells_df
+        else np.zeros(n_all), dtype=float)
+    ar = np.asarray(
+        cells_df["cell_area"] if "cell_area" in cells_df else np.zeros(n_all),
+        dtype=float)
+    if scene_bounds is not None:
+        bx0, by0, bx1, by1 = (float(v) for v in scene_bounds)
+    else:
+        bx0, by0, bx1, by1 = xs.min(), ys.min(), xs.max(), ys.max()
+
+    # Overlapping candidate grid (stride = size/2) fully inside the extent.
+    stride = size_um / 2.0
+    gx = np.arange(bx0, max(bx0, bx1 - size_um) + 1e-6, stride)
+    gy = np.arange(by0, max(by0, by1 - size_um) + 1e-6, stride)
+    if gx.size == 0:
+        gx = np.array([bx0])
+    if gy.size == 0:
+        gy = np.array([by0])
+
+    rows = []  # x0, y0, cx, cy, count, mean_tx, mean_area
+    for wy in gy:
+        for wx in gx:
+            m = (xs >= wx) & (xs < wx + size_um) & (ys >= wy) & (ys < wy + size_um)
+            c = int(m.sum())
+            if c < min_cells:
+                continue
+            rows.append((wx, wy, wx + size_um / 2, wy + size_um / 2, c,
+                         float(tx[m].mean()), float(ar[m].mean())))
+
+    if not rows:
+        # No cell-dense window (tiny / sparse scope): one centered window so
+        # A3 still renders something rather than skipping silently.
+        cx, cy = 0.5 * (bx0 + bx1), 0.5 * (by0 + by1)
+        h = size_um / 2
+        return [((cx - h, cy - h, cx + h, cy + h), "region1")]
+
+    C = np.asarray(rows, dtype=float)
+    # Adaptive density floor: drop near-background / edge windows (too sparse
+    # to judge render fidelity) by keeping windows at or above the 40th
+    # percentile of populated-window counts — but only if that still leaves
+    # enough candidates. Diversity then comes from the *populated* density
+    # range + composition + space, not from picking empty tissue edges.
+    if len(C) > n:
+        thr = np.percentile(C[:, 4], 40)
+        keep = C[:, 4] >= thr
+        if int(keep.sum()) >= n:
+            C = C[keep]
+    feats = np.stack([C[:, 2], C[:, 3], np.log1p(C[:, 4]), C[:, 5], C[:, 6]], axis=1)
+    sd = feats.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = (feats - feats.mean(axis=0)) / sd
+
+    n_pick = min(n, len(rows))
+    chosen = [int(np.argmax(C[:, 4]))]            # seed: densest window
+    dist = np.linalg.norm(Z - Z[chosen[0]], axis=1)
+    while len(chosen) < n_pick:
+        nxt = int(np.argmax(dist))
+        chosen.append(nxt)
+        dist = np.minimum(dist, np.linalg.norm(Z - Z[nxt], axis=1))
+
+    chosen.sort(key=lambda i: -C[i, 4])           # densest → sparsest
+    out = []
+    for rank, idx in enumerate(chosen):
+        x0, y0 = C[idx, 0], C[idx, 1]
+        out.append(((x0, y0, x0 + size_um, y0 + size_um), f"region{rank + 1}"))
+    return out
+
+
+def load_regions_file(path) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Parse an explicit A3 regions file → ``[(bounds, label), ...]`` (global µm).
+
+    JSON: a list (or ``{"regions": [...]}``) of objects, each either
+    ``{"name", "xmin", "ymin", "xmax", "ymax"}`` or ``{"name", "bounds": [..]}``.
+    CSV: header row ``name,xmin,ymin,xmax,ymax``.
+    """
+    p = Path(path)
+    txt = p.read_text()
+    out: list[tuple[tuple[float, float, float, float], str]] = []
+    if p.suffix.lower() == ".json" or txt.lstrip()[:1] in ("[", "{"):
+        data = json.loads(txt)
+        if isinstance(data, dict):
+            data = data.get("regions", [])
+        for i, e in enumerate(data):
+            b = ([float(v) for v in e["bounds"]] if "bounds" in e
+                 else [float(e[k]) for k in ("xmin", "ymin", "xmax", "ymax")])
+            out.append((tuple(b), str(e.get("name", f"region{i + 1}"))))
+    else:
+        import csv
+        import io
+        for i, row in enumerate(csv.DictReader(io.StringIO(txt))):
+            b = [float(row[k]) for k in ("xmin", "ymin", "xmax", "ymax")]
+            out.append((tuple(b), str(row.get("name") or f"region{i + 1}")))
+    return out
+
+
+def _resolve_diagnostic_model(synth_dir: Path, model_dir) -> Path:
+    """Resolve the model for the render-based panels (A3).
+
+    A synth bundle and the display LUT of the model that wrote it are a matched
+    pair — rendering or LUT-normalizing with a *different* model corrupts the
+    comparison (this is exactly what produced a spurious breast A3 mismatch).
+    Prefer the model recorded in the bundle's ``synth_metadata.model_dir``; an
+    explicit ``model_dir`` overrides it (warning on mismatch)."""
+    recorded = None
+    try:
+        meta = json.loads((Path(synth_dir) / "experiment.xenium").read_text())
+        recorded = (meta.get("synth_metadata") or {}).get("model_dir")
+    except Exception:
+        pass
+    if model_dir is not None:
+        if recorded and str(recorded) != str(model_dir):
+            print(f"[diagnostics] model OVERRIDE: using {model_dir} — but the "
+                  f"bundle records model_dir={recorded}; panels 1-3 may not "
+                  f"match the saved bundle (panel 4).", file=sys.stderr)
+        return Path(model_dir)
+    if recorded and Path(recorded).exists():
+        print(f"[diagnostics] model (from bundle synth_metadata): {recorded}",
+              file=sys.stderr)
+        return Path(recorded)
+    raise ValueError(
+        f"No model given and none usable in {synth_dir}/experiment.xenium "
+        f"synth_metadata.model_dir (recorded={recorded!r}). Pass an explicit model.")
 
 
 def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
-                            model_dir: str | Path, out_dir: Path,
-                            regions: list = None) -> list[Path]:
+                            model_dir: str | Path | None = None,
+                            out_dir: Path = None,
+                            regions: list = None,
+                            workers: int | None = None) -> list[Path]:
     """Produce the standard explain diagnostic set:
 
       A1.  Whole-bundle thumbnail (real vs synth, low-res morphology pyramid).
@@ -259,9 +404,8 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     """
     bundle_path = Path(bundle_path)
     synth_dir   = Path(synth_dir)
-    model_dir   = Path(model_dir)
+    model_dir   = _resolve_diagnostic_model(synth_dir, model_dir)
     out_dir     = Path(out_dir)
-    regions     = regions or STANDARD_REGIONS
 
     # Scope is a first-class input: read the synth bundle's rendered extent
     # ONCE (single source of truth — bundle_bounds_um) and hand it to every
@@ -271,53 +415,85 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     scene_bounds = bundle_bounds_um(synth_dir)
     print(f"[diagnostics] scope: {_scope_label(scene_bounds)}", file=sys.stderr)
 
-    # Restrict A3 bench regions to the rendered extent (region bundles only
-    # cover part of the slide). Keep those that fit; if none do, synthesize
-    # in-bounds bench regions centered in the rendered area.
-    if scene_bounds is not None:
+    # A3 bench regions. Default: data-driven, diverse, stable selection from
+    # the REAL bundle's 10x cell calls (no hard-coded, tissue-specific coords).
+    # Explicit regions (CLI --diagnostic-regions) override; those are kept as
+    # given but filtered to anything overlapping the rendered scope.
+    if regions is None:
+        try:
+            import pandas as pd
+            cdf = pd.read_parquet(bundle_path / "cells.parquet")
+            regions = select_bench_regions(cdf, scene_bounds=scene_bounds)
+            print(f"[diagnostics] A3 regions (data-driven from 10x cell calls): "
+                  f"{[lab for _, lab in regions]}", file=sys.stderr)
+        except Exception as e:
+            print(f"[diagnostics] A3 region selection failed ({e}); "
+                  f"A3 will be skipped", file=sys.stderr)
+            regions = []
+    elif scene_bounds is not None:
         x0b, y0b, x1b, y1b = scene_bounds
         kept = [(b, lab) for (b, lab) in regions
-                if b[0] >= x0b and b[1] >= y0b and b[2] <= x1b and b[3] <= y1b]
-        if not kept:
-            cx, cy = 0.5 * (x0b + x1b), 0.5 * (y0b + y1b)
-            for s, lab in ((300.0, "region_center"), (490.0, "region_wide")):
-                h = s / 2
-                bx0, by0 = max(x0b, cx - h), max(y0b, cy - h)
-                kept.append(((bx0, by0, min(x1b, bx0 + s), min(y1b, by0 + s)), lab))
+                if not (b[2] <= x0b or b[0] >= x1b or b[3] <= y0b or b[1] >= y1b)]
+        for b, lab in regions:
+            if (b, lab) not in kept:
+                _skip("A3", f"region {lab} outside rendered scope")
         regions = kept
 
+    # Each panel is independent and writes its own PNG(s), so they run in
+    # parallel across processes. A spawn pool keeps matplotlib state per
+    # process (Agg, no shared pyplot races) and contains a panel crash/OOM
+    # to its own worker — the rest still complete (the failure mode that
+    # silently truncated earlier whole-bundle runs). A3 owns the only GPU
+    # task (one model.render subprocess); everything else is CPU/IO.
+    tasks = [
+        (_plot_whole_bundle_thumbnail,
+         (bundle_path, synth_dir, model_dir, out_dir, scene_bounds), {}),
+        (_plot_midscale_regions,
+         (bundle_path, synth_dir, model_dir, out_dir, scene_bounds), {}),
+        (_plot_tile_3panels,
+         (bundle_path, synth_dir, model_dir, out_dir, regions), {}),
+        (_plot_cell_level_grid,
+         (bundle_path, synth_dir, model_dir, out_dir), {"scene_bounds": scene_bounds}),
+        (_plot_celltype_breakdown, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_per_cell_distributions, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_type_resolution_breakdown, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_per_gene_scatter, (bundle_path, synth_dir, out_dir), {}),
+        (_plot_intensity_histograms,
+         (bundle_path, synth_dir, model_dir, out_dir),
+         {"scene_bounds": scene_bounds}),
+    ]
+
+    def _norm(res):
+        if res is None:
+            return []
+        if isinstance(res, (list, tuple)):
+            return [p for p in res if p is not None]
+        return [res]
+
+    import os
+    n = workers if workers is not None else min(len(tasks), max(2, (os.cpu_count() or 4)))
+    n = max(1, min(n, len(tasks)))
+
     written: list[Path] = []
-    def _add(p):
-        if p is not None: written.append(p)
+    if n > 1:
+        try:
+            import multiprocessing as _mp
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            ctx = _mp.get_context("spawn")
+            print(f"[diagnostics] running {len(tasks)} panels on {n} workers",
+                  file=sys.stderr)
+            with ProcessPoolExecutor(max_workers=n, mp_context=ctx) as ex:
+                futs = [ex.submit(_safe, fn, *a, **kw) for fn, a, kw in tasks]
+                for f in as_completed(futs):
+                    written.extend(_norm(f.result()))
+            return written
+        except Exception as e:
+            print(f"[diagnostics] parallel pool failed ({e}); "
+                  f"falling back to sequential", file=sys.stderr)
+            written = []
 
-    # A. Real vs render across scales (scope-aware)
-    _add(_safe(_plot_whole_bundle_thumbnail, bundle_path, synth_dir,
-                  model_dir, out_dir, scene_bounds))
-    for p in _safe(_plot_midscale_regions, bundle_path, synth_dir,
-                       model_dir, out_dir, scene_bounds) or []:
-        _add(p)
-    for p in _safe(_plot_tile_3panels, bundle_path, synth_dir, model_dir,
-                       out_dir, regions) or []:
-        _add(p)
-    _add(_safe(_plot_cell_level_grid, bundle_path, synth_dir, model_dir,
-                  out_dir, scene_bounds=scene_bounds))
-
-    # B. Population stats
-    _add(_safe(_plot_celltype_breakdown, bundle_path, synth_dir, out_dir))
-    _add(_safe(_plot_per_cell_distributions, bundle_path, synth_dir, out_dir))
-
-    # T. Cell-type resolution provenance (skipped silently on bundles
-    # written by pre-resolver-refactor xesim that don't have the
-    # cell_type_source column).
-    _add(_safe(_plot_type_resolution_breakdown, bundle_path, synth_dir, out_dir))
-
-    # C. Transcript level
-    _add(_safe(_plot_per_gene_scatter, bundle_path, synth_dir, out_dir))
-
-    # D. Intensity
-    _add(_safe(_plot_intensity_histograms, bundle_path, synth_dir,
-                  model_dir, out_dir))
-
+    for fn, a, kw in tasks:
+        written.extend(_norm(_safe(fn, *a, **kw)))
     return written
 
 
@@ -1150,14 +1326,17 @@ def _plot_type_resolution_breakdown(bundle_path: Path, synth_dir: Path,
 
 def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
                                      model_dir: Path, out_dir: Path,
-                                     region: tuple = (1750, 1300, 2240, 1790)
-                                     ) -> Path:
+                                     region: tuple | None = None,
+                                     scene_bounds=None,
+                                     win_um: float = 490.0) -> Path:
     """D10: per-channel pixel-intensity histograms, real vs synth, log-y.
-    Sampled at a single tile-scale region (the ductal bench)."""
+    Sampled at a single, deterministic, cell-dense tile-scale window WITHIN
+    the rendered scope (so it works for region bundles + any tissue, and
+    re-running the same crop picks the same window)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import tifffile
+    import pandas as pd
     import json as _j
 
     out = Path(out_dir) / "stats_D10_intensity_histograms.png"
@@ -1167,7 +1346,33 @@ def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
             "pixel_size", 0.2125))
     except Exception:
         pass
-    xmin, ymin, xmax, ymax = region
+    # Pick a deterministic, cell-dense window within scope (densest of a
+    # coarse in-scope grid; ties broken by position → reproducible). Falls
+    # back to an explicit `region` if given.
+    if region is None:
+        cr = pd.read_parquet(bundle_path / "cells.parquet",
+                             columns=["x_centroid", "y_centroid"])
+        cx0, cx1 = cr.x_centroid.min(), cr.x_centroid.max()
+        cy0, cy1 = cr.y_centroid.min(), cr.y_centroid.max()
+        if scene_bounds is not None:
+            cx0 = max(cx0, scene_bounds[0]); cy0 = max(cy0, scene_bounds[1])
+            cx1 = min(cx1, scene_bounds[2]); cy1 = min(cy1, scene_bounds[3])
+        side = float(min(win_um, 0.8 * min(cx1 - cx0, cy1 - cy0)))
+        if side <= 0:
+            return _skip("D10", f"no in-scope area for {_scope_label(scene_bounds)}")
+        best = None
+        for x0 in np.linspace(cx0, cx1 - side, 6):
+            for y0 in np.linspace(cy0, cy1 - side, 6):
+                n = int(((cr.x_centroid >= x0) & (cr.x_centroid < x0 + side) &
+                         (cr.y_centroid >= y0) & (cr.y_centroid < y0 + side)).sum())
+                if best is None or n > best[0]:
+                    best = (n, float(x0), float(y0))
+        if best is None or best[0] == 0:
+            return _skip("D10", f"no in-scope cell-dense window for "
+                         f"{_scope_label(scene_bounds)}")
+        xmin, ymin, xmax, ymax = best[1], best[2], best[1] + side, best[2] + side
+    else:
+        xmin, ymin, xmax, ymax = region
     # Bounded reads — avoid loading multi-GB full morphology to RAM
     # (24.5 GB on the breast 5K bundle; full load OOMs).
     from .scene_2d.render_tile import real_tile_image
@@ -1177,7 +1382,8 @@ def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
     synth = real_tile_image(str(synth_dir),
         tile_bounds_um=bounds, pixel_size_um=psz)
     if real is None or synth is None:
-        return out
+        return _skip("D10", f"morphology region {bounds} not readable "
+                     f"({_scope_label(scene_bounds)})")
     h = min(real.shape[1], synth.shape[1]); w = min(real.shape[2], synth.shape[2])
     real = real[:, :h, :w]; synth = synth[:, :h, :w]
 
@@ -1208,8 +1414,9 @@ def _plot_intensity_histograms(bundle_path: Path, synth_dir: Path,
         if ci == 0: axes[ci].set_ylabel("density (log)")
         axes[ci].legend(fontsize=8); axes[ci].grid(alpha=0.25, which="both")
     fig.suptitle(
-        f"D10. Per-channel intensity histograms — ductal bench region "
-        f"({int(xmax-xmin)}×{int(ymax-ymin)} µm)",
+        f"D10. Per-channel intensity histograms — {int(xmax-xmin)}×"
+        f"{int(ymax-ymin)} µm window @ ({int(xmin)},{int(ymin)}) "
+        f"[{_scope_label(scene_bounds)}]",
         fontsize=11, fontweight="bold")
     plt.tight_layout(rect=(0, 0, 1, 0.95))
     plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="white")
@@ -1221,5 +1428,6 @@ __all__ = [
     "fit_model_diagnostics",
     "fit_priors_diagnostics",
     "explain_diagnostics",
-    "STANDARD_REGIONS",
+    "select_bench_regions",
+    "load_regions_file",
 ]

@@ -398,16 +398,30 @@ def fit_nucleus_priors_from_bundle(
         z_df = pd.read_parquet(cells_z_path)
         merged = cell_stats.merge(z_df, on="cell_id", how="inner")
         merged = merged.dropna(subset=["cell_type", "z_extent_um"])
+        has_zc = "z_center_um" in merged.columns
         for name, sub in merged.groupby("cell_type"):
             if len(sub) < min_per_type:
                 continue
             z = sub["z_extent_um"].to_numpy()
-            per_type_z_summary[str(name)] = {
+            entry = {
                 "n": int(len(z)),
                 "z_extent_p10": float(np.quantile(z, 0.10)),
                 "z_extent_p50": float(np.quantile(z, 0.50)),
                 "z_extent_p90": float(np.quantile(z, 0.90)),
             }
+            if has_zc:
+                # z_center distribution = the tissue section's z-position /
+                # thickness (real nuclei concentrate mid-section). Recorded so
+                # unobserved-cell placement matches it, not the z-edges.
+                zc = sub["z_center_um"].to_numpy()
+                zc = zc[np.isfinite(zc)]
+                if zc.size:
+                    entry.update({
+                        "z_center_p10": float(np.quantile(zc, 0.10)),
+                        "z_center_p50": float(np.quantile(zc, 0.50)),
+                        "z_center_p90": float(np.quantile(zc, 0.90)),
+                    })
+            per_type_z_summary[str(name)] = entry
         if verbose:
             print(f"[fit_priors] per-cell z attrs attached for "
                   f"{len(per_type_z_summary)} types")

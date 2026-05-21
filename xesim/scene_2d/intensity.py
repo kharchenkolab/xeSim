@@ -123,14 +123,19 @@ def calibrate_to_uint16(
       2/256, ..., 1). Each synth pixel is replaced with the target value at
       its empirical quantile in the synth channel.
 
-    * ``"off"`` (no ``target_stats``): original ``clip(arr/p99.5)*4095``
-      behavior — preserved for backwards-compatibility and unstained bundles.
+    * ``"none"``: truly no calibration — a fixed ``round(arr)*fallback_max_val``
+      scale, with NO per-channel stats, display LUT, or target matching. For
+      inspecting raw renderer output and unstained bundles.
 
-    ``arr`` already-uint16 inputs are returned unchanged (idempotent).
+    ``lut_native`` is the default at the CLI. ``arr`` already-uint16 inputs are
+    returned unchanged (idempotent).
     """
     if arr.dtype == np.uint16:
         return arr
     arr = np.clip(arr.astype(np.float32), 0, None)
+    if mode == "none":
+        # No calibration: fixed linear scale, no per-channel/LUT/stat work.
+        return np.clip(np.round(arr * fallback_max_val), 0, max_val).astype(np.uint16)
     if arr.ndim == 2:
         p = float(np.percentile(arr, p99))
         return (np.clip(arr / max(p, 1e-6), 0, 1) * fallback_max_val).astype(np.uint16)

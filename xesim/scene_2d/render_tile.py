@@ -37,7 +37,8 @@ def real_tile_image(
     Returns (n_channels, H, W) float32 (in [0, 1] if display_lut is given).
     n_channels = all available if None.
     """
-    from ..images import ImageStackReader
+    from .. import images as _imgmod
+    from ..images import ImageStackReader, crop_pixel_bounds, set_region_hint
     from ..models import CropBox
     from ..xenium import resolve_bundle
     from ..qc import normalize_images_with_lut
@@ -57,7 +58,19 @@ def real_tile_image(
                         ymin=ymin - oy, ymax=ymax - oy,
                         crop_id="real_tile")
         reader = ImageStackReader(bundle.morphology_focus_paths, bundle.pixel_size)
-        img = np.asarray(reader.read(crop), dtype=np.float32)
+        # Read ONLY the requested region, not the full plane. Without a region
+        # hint, OmeCropReader decompresses + caches the ENTIRE morphology plane
+        # (~31 GB for a breast bundle) just to crop a small tile — so several
+        # one-off region reads (diagnostics A2/A4/D10 in parallel) OOM the box.
+        # Scope the read to the crop's local pixel bbox; restore the prior hint
+        # afterward (set_region_hint also clears the cache, freeing the region).
+        x0, x1, y0, y1 = crop_pixel_bounds(crop, bundle.pixel_size, shape=None)
+        _prev_hint = _imgmod._REGION_HINT_BBOX_PX
+        set_region_hint((y0, y1, x0, x1))
+        try:
+            img = np.asarray(reader.read(crop), dtype=np.float32)
+        finally:
+            set_region_hint(_prev_hint)
         if img.size == 0:
             return None
         if display_lut is not None:

@@ -148,6 +148,20 @@ class StreamingStitchWriter:
         self.progress = progress
         self.feather = _feather_mask(self.tile_px, self.overlap_px) \
                        if self.overlap_px > 0 else None
+
+        # Global-stat calibration modes (scale/match2/histmatch) need
+        # statistics over the WHOLE image; computing them per strip would
+        # seam tiles of differing composition. For those modes we run a
+        # two-pass scheme: pass 1 writes a linear preliminary uint16 to the
+        # base memmap (monotonic → global quantiles preserved) and
+        # accumulates a per-channel histogram; close() then builds a global
+        # remap LUT and applies it to the base in-place before the pyramid.
+        # lut_native/lut_zerofloor/none are strip-independent → unchanged
+        # single-pass fast path (no histogram, no extra pass).
+        self._needs_global = self.intensity_mode in ("scale", "match2", "histmatch")
+        self._prelim_scale = 16384.0   # float→u16 prelim; >4.0 would clip (rare)
+        self._hist = ([np.zeros(65536, dtype=np.int64) for _ in range(self.n_ch)]
+                      if self._needs_global else None)
         # OME-TIFF compression. Real Xenium morphology TIFFs are
         # compressed (JPEG-2000); for the streaming path (large bundles)
         # we default to ZSTD — lossless, fast, and crucial for the
@@ -337,17 +351,27 @@ class StreamingStitchWriter:
         for c in range(self.n_ch):
             np.divide(value[c], weight, out=value[c])
 
-        # Calibrate to uint16 per channel using the supplied LUT mode.
-        # We hand `calibrate_to_uint16` the full per-channel band; it
-        # handles per-channel scaling + noise injection.
-        u16_band = calibrate_to_uint16(
-            value,
-            channel_names=self.channel_names,
-            target_stats=self.target_intensity_stats,
-            target_quantiles=self.target_intensity_quantiles,
-            mode=self.intensity_mode,
-            display_lut=self.display_lut,
-        )
+        # Calibrate to uint16 per channel.
+        if self._needs_global:
+            # Pass 1: linear preliminary (global-stat-free) + accumulate the
+            # per-channel histogram. Final global remap happens in close().
+            u16_band = np.clip(value * self._prelim_scale,
+                               0, 65535).astype(np.uint16)
+            for c in range(self.n_ch):
+                self._hist[c] += np.bincount(u16_band[c].ravel(),
+                                             minlength=65536)
+        else:
+            # Strip-independent modes (lut_native / lut_zerofloor / none):
+            # final calibration here. calibrate_to_uint16 also handles the
+            # per-pixel sensor-noise injection for the lut_native family.
+            u16_band = calibrate_to_uint16(
+                value,
+                channel_names=self.channel_names,
+                target_stats=self.target_intensity_stats,
+                target_quantiles=self.target_intensity_quantiles,
+                mode=self.intensity_mode,
+                display_lut=self.display_lut,
+            )
 
         # Write to base memmap at the right y offset.
         if s == self.n_rows:
@@ -412,6 +436,13 @@ class StreamingStitchWriter:
         for a in self._base_arrays:
             a.flush()
 
+        # Pass 2 for global-stat modes: now that the whole image is on disk
+        # (preliminary uint16) with a complete per-channel histogram, build a
+        # GLOBAL remap LUT and apply it in-place. This makes scale/match2/
+        # histmatch use whole-image statistics (no per-strip seams).
+        if self._needs_global:
+            self._apply_global_calibration()
+
         # Build pyramid + write OME-TIFFs. Each per-channel
         # morphology_focus_NNNN gets its base + 7 sub-IFD pyramid levels.
         if self.progress:
@@ -448,6 +479,65 @@ class StreamingStitchWriter:
             self.pixel_size_um)
 
         return written
+
+    def _build_remap_lut(self, c: int) -> np.ndarray:
+        """Build a (65536,) uint16 remap LUT for channel ``c`` implementing
+        the chosen global-stat mode from the accumulated histogram.
+
+        The base memmap holds the linear preliminary ``prelim = float *
+        prelim_scale``; the remap operates purely in prelim-uint16 space, so
+        the (arbitrary) ``prelim_scale`` cancels out — the result equals what
+        ``calibrate_to_uint16`` would produce on the full float image.
+        """
+        hist = self._hist[c].astype(np.float64)
+        total = max(float(hist.sum()), 1.0)
+        cdf = np.cumsum(hist) / total                       # CDF over 0..65535
+        v = np.arange(65536, dtype=np.float64)
+        ch_name = (self.channel_names[c]
+                   if c < len(self.channel_names) else None)
+
+        def pct(p: float) -> float:                          # prelim value at pct p
+            return float(np.searchsorted(cdf, p / 100.0))
+
+        tq = (self.target_intensity_quantiles or {})
+        ts = (self.target_intensity_stats or {})
+        if self.intensity_mode == "histmatch" and ch_name in tq:
+            tvals = np.asarray(tq[ch_name], dtype=np.float64)   # K target values
+            k = len(tvals)
+            idx_f = np.clip(cdf * (k - 1), 0, k - 1)            # per-prelim quantile
+            lo = np.floor(idx_f).astype(np.int64)
+            hi = np.minimum(lo + 1, k - 1)
+            frac = idx_f - lo
+            lut = tvals[lo] * (1 - frac) + tvals[hi] * frac
+        elif self.intensity_mode in ("scale", "match2") and ch_name in ts:
+            tp50, tp99 = float(ts[ch_name][0]), float(ts[ch_name][1])
+            p99 = pct(99.5)
+            if self.intensity_mode == "scale":
+                lut = v * (tp99 / max(p99, 1e-6))
+            else:  # match2
+                p50 = pct(50.0)
+                lut = (v - p50) * (tp99 - tp50) / max(p99 - p50, 1e-6) + tp50
+        else:
+            # No target for this channel → global p99.5 → 4095 (the "off"
+            # fallback, but computed GLOBALLY rather than per strip).
+            p99 = pct(99.5)
+            lut = v * (4095.0 / max(p99, 1e-6))
+        return np.clip(lut, 0, 65535).astype(np.uint16)
+
+    def _apply_global_calibration(self) -> None:
+        """Apply the per-channel global remap LUT to each base memmap in
+        row-chunks (bounded memory), in place."""
+        chunk = max(1, (1 << 26) // max(self.W, 1))   # ~64M-elem row blocks
+        for c in range(self.n_ch):
+            lut = self._build_remap_lut(c)
+            base = self._base_arrays[c]
+            for r0 in range(0, self.H, chunk):
+                r1 = min(r0 + chunk, self.H)
+                base[r0:r1] = lut[base[r0:r1]]
+            base.flush()
+        if self.progress:
+            print(f"[stream] applied global {self.intensity_mode} "
+                  f"calibration ({self.n_ch} channels)", flush=True)
 
     def cleanup(self) -> None:
         """Release temp files. Call after the bundle directory is done

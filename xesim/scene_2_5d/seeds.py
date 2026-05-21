@@ -71,6 +71,32 @@ def _per_type_z_extent_dist(z_attrs: pd.DataFrame,
     return out
 
 
+def _per_type_z_center_dist(z_attrs: pd.DataFrame,
+                              cell_annotation_df: pd.DataFrame,
+                              ) -> dict[str, np.ndarray]:
+    """For each cell type, an empirical sample of observed z_centers — the
+    tissue section's z-position/thickness.
+
+    Real nuclei concentrate in the mid tissue-section (e.g. ~12-21µm of a 33µm
+    z-stack), NOT uniformly across the acquisition depth. Unobserved cells are
+    drawn from this measured distribution (they sit in the same section as
+    observed cells), instead of the old edge-biased heuristic that placed them
+    at the z-extremes where there is no tissue. Includes a ``__global__`` pool
+    for sparse types.
+    """
+    ann_col = ("merged_annotation" if "merged_annotation" in cell_annotation_df.columns
+                else "_cell_type")
+    m = z_attrs.merge(cell_annotation_df[["cell_id", ann_col]].rename(
+        columns={ann_col: "cell_type"}), on="cell_id", how="left")
+    m["cell_type"] = m["cell_type"].fillna("unknown")
+    m = m[np.isfinite(m["z_center_um"])]
+    out = {}
+    for t, g in m.groupby("cell_type"):
+        out[t] = g["z_center_um"].to_numpy(dtype=np.float32)
+    out["__global__"] = m["z_center_um"].to_numpy(dtype=np.float32)
+    return out
+
+
 def sample_unobserved_seeds(
     region_bounds_um: tuple[float, float, float, float],
     observed_cells: pd.DataFrame,
@@ -108,8 +134,9 @@ def sample_unobserved_seeds(
     p = underseg_probs or PLAN3D_UNDERSEG_PROBS
     xmin, ymin, xmax, ymax = region_bounds_um
 
-    # Per-type empirical z_extent distribution from observed cells
+    # Per-type empirical z_extent + z_center distributions from observed cells
     z_ext_dist = _per_type_z_extent_dist(z_attrs, cell_annotation_df)
+    z_ctr_dist = _per_type_z_center_dist(z_attrs, cell_annotation_df)
 
     seeds: list[UnobservedSeed] = []
     if len(observed_cells) == 0:
@@ -135,13 +162,19 @@ def sample_unobserved_seeds(
             cy = float(row["centroid_y"]) + float(jitter_xy[i, 1])
             if not (xmin <= cx < xmax and ymin <= cy < ymax):
                 continue
-            # z_center uniform within imaged depth, but bias toward
-            # away-from-mid (where 10x would have detected easily)
-            z_centers_dist = np.concatenate([
-                rng.uniform(0.0, imaged_depth_um * 0.3, size=1),
-                rng.uniform(imaged_depth_um * 0.7, imaged_depth_um, size=1),
-            ])
-            zc = float(rng.choice(z_centers_dist))
+            # z_center from the observed section z-distribution: unobserved
+            # cells sit within the same tissue section as observed cells
+            # (mid-concentrated), NOT at the acquisition z-edges. (The old
+            # edge-biased uniform contradicted the measured z_attrs
+            # distribution and put in-focus nuclei on empty edge planes.)
+            zc_pool = z_ctr_dist.get(ct)
+            if zc_pool is None or len(zc_pool) < 20:
+                zc_pool = z_ctr_dist.get("__global__")
+            if zc_pool is not None and len(zc_pool) > 0:
+                zc = float(rng.choice(zc_pool) + rng.normal(scale=1.5))
+            else:
+                zc = imaged_depth_um / 2.0
+            zc = float(np.clip(zc, 0.0, imaged_depth_um))
             # z_extent from per-type empirical
             ze_pool = z_ext_dist.get(ct, np.array([15.0], dtype=np.float32))
             ze = float(rng.choice(ze_pool))

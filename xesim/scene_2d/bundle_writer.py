@@ -1006,6 +1006,7 @@ def write_bundle(
     real_bundle_path: str | Path | None = None,
     display_lut: dict | None = None,
     geom_stash: dict[str, dict] | None = None,
+    model_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Write a synthetic Xenium-compatible bundle directory.
 
@@ -1228,11 +1229,17 @@ def write_bundle(
         "synth_metadata": {
             "n_ghost_cells": ghost_cells_total,
             "ground_truth_in_cell_id_column": True,
+            # Render provenance — so a bundle self-documents how it was made
+            # (a missing model_dir is exactly what made an earlier bundle's
+            # render impossible to reconstruct / mismatched in diagnostics).
+            "model_dir": str(model_dir) if model_dir is not None else None,
+            "source_bundle": str(real_bundle_path) if real_bundle_path is not None else None,
             "intensity_calibration": (
                 {k: list(v) for k, v in target_intensity_stats.items()}
                 if target_intensity_stats else None
             ),
             "intensity_mode": intensity_mode,
+            "noise_calibrated": bool(display_lut and display_lut.get("noise_stats")),
             "n_morphology_focus_files": n_morphology_focus_files,
             "n_pyramid_levels": n_pyramid_levels,
         },
