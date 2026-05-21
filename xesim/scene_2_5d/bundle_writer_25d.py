@@ -34,7 +34,10 @@ def write_bundle_25d(
     config: dict | None = None,
     overwrite: bool = False,
     target_intensity_stats: dict | None = None,
+    target_intensity_quantiles: dict | None = None,
     intensity_mode: str = "scale",
+    display_lut: dict | None = None,
+    model_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Write a Xenium-compatible bundle with 2.5D additions.
 
@@ -229,7 +232,7 @@ def write_bundle_25d(
     # (pancreas), p99=1.0 maps to ≈3841 — preserves channel ratios vs the
     # focal-plane DAPI written below.
     from ..scene_2d.render_tile import load_model_display_lut as _llut
-    _lut = _llut(str(model.paths.root))
+    _lut = display_lut if display_lut is not None else _llut(str(model.paths.root))
     _dapi_lo, _dapi_hi = 0.0, 4095.0
     if _lut is not None:
         for c in _lut.get("channels", []):
@@ -269,12 +272,14 @@ def write_bundle_25d(
     # bundle writer. Without it, the writer falls back to pure "off"
     # mode (per-channel p99→4095) which destroys inter-channel ratios
     # and produces DAPI-saturated, aSMA-inflated bundle output.
-    from ..scene_2d.render_tile import load_model_display_lut
-    display_lut = load_model_display_lut(str(model.paths.root))
+    if display_lut is None:
+        from ..scene_2d.render_tile import load_model_display_lut
+        display_lut = load_model_display_lut(str(model.paths.root))
     _write_morphology_focus(
         compose_result.focal_2d_render,        # (C, H, W) float32
         channel_names, psz, out_dir,
         target_stats=target_intensity_stats,
+        target_quantiles=target_intensity_quantiles,
         intensity_mode=intensity_mode,
         n_replica_files=max(4, n_ch),
         n_pyramid_levels=8,
@@ -388,7 +393,12 @@ def write_bundle_25d(
             "scene_mode": "2.5d",
             "n_z": int(len(compose_result.z_slices_um)),
             "ground_truth_in_cell_id_column": True,
+            # Render provenance — matches the 2D writer so a bundle self-
+            # documents its model (and the diagnostic can self-select it).
+            "model_dir": str(model_dir) if model_dir is not None else None,
+            "source_bundle": str(real_bundle_path) if real_bundle_path is not None else None,
             "intensity_mode": intensity_mode,
+            "noise_calibrated": bool(display_lut and display_lut.get("noise_stats")),
         },
     }
     (out_dir / "experiment.xenium").write_text(json.dumps(experiment, indent=2))

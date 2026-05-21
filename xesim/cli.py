@@ -349,9 +349,15 @@ def _explain_25d(args: argparse.Namespace) -> None:
     else:
         raise SystemExit("--scene-mode 2.5d requires --tile, --region, or --whole-bundle")
 
-    # Resolve intensity calibration for non-DAPI channels
-    target_intensity_stats, _, calib_mode = _resolve_intensity_calibration(
-        args.intensity_calibration, args.bundle, model)
+    # Resolve calibration via the shared single source of truth (same config
+    # the 2D path uses: display LUT + per-channel sensor noise + histmatch/
+    # scale targets), so the 2.5D focal-plane morphology is calibrated exactly
+    # like the 2D bundle writer instead of a parallel, noise-free reimplementation.
+    from .scene_2d.render_region import resolve_render_calibration
+    _calib = resolve_render_calibration(
+        model, args.bundle, model_dir=args.model, mode=args.intensity_calibration)
+    target_intensity_stats = _calib["target_stats"]
+    calib_mode = _calib["mode"]
 
     if use_stitch:
         stitch_tile_um = float(args.stitch_tile_um)
@@ -402,7 +408,10 @@ def _explain_25d(args: argparse.Namespace) -> None:
         real_bundle_path=args.bundle,
         config=cfg, overwrite=args.overwrite,
         target_intensity_stats=target_intensity_stats,
+        target_intensity_quantiles=_calib["target_quantiles"],
         intensity_mode=calib_mode,
+        display_lut=_calib["display_lut"],
+        model_dir=str(args.model),
     )
     import json
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
