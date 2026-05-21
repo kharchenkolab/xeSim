@@ -87,15 +87,16 @@ def render_region_3panel(bundle_path: str | Path, synth_dir: str | Path,
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from .realism_panel import (composite_rgb, real_image_for_bounds,
-                                render_region_via_cli_path)
+    from .realism_panel import composite_rgb, real_image_for_bounds
+    from .render_region import render_region, resolve_render_calibration
     from .render_tile import load_model_display_lut
     from ..model import XesimModel
 
     bundle_path = str(bundle_path); synth_dir = Path(synth_dir)
     model = XesimModel.load(str(model_dir))
     psz = float(model.pixel_size)
-    ch_names = getattr(model, "_channel_names", None)
+    ch_names = (getattr(model, "_channel_names", None)
+                or list(model.manifest.get("channel_names") or []))
     lut = load_model_display_lut(str(model_dir))
 
     if region is not None:
@@ -108,36 +109,61 @@ def render_region_3panel(bundle_path: str | Path, synth_dir: str | Path,
                   float(cells.x_centroid.max() + 30),
                   float(cells.y_centroid.max() + 30))
 
+    # Render through the SAME shared path production uses, with the SAME
+    # default calibration → panel 3 is exactly what `xesim explain` writes
+    # today (no reimplemented render/calibration that can silently drift).
+    calib = resolve_render_calibration(model, bundle_path, model_dir=str(model_dir),
+                                       mode="off")
     real = real_image_for_bounds(model, bundle_path, bounds)
-    res = render_region_via_cli_path(model, bundle_path, bounds,
-                                     add_ghosts=True, add_transcript_proposed=False)
-    mrender = res["image"]; n_anchors = res["n_anchors"]
+    res = render_region(model, bundle_path, bounds, calibration=calib,
+                        model_path=str(model_dir))
+    mrender = res["float_image"]; n_anchors = res["n_anchors"]
+    calib_synth = _lut_norm_uint16(res["uint16_image"], lut)
     bundle = _load_bundle_morphology(
         synth_dir, ch_names or ["DAPI", "ATP", "18S", "aSMA"], bounds, psz, lut)
 
-    h = min(real.shape[1], mrender.shape[1], bundle.shape[1])
-    w = min(real.shape[2], mrender.shape[2], bundle.shape[2])
-    real, mrender, bundle = real[:, :h, :w], mrender[:, :h, :w], bundle[:, :h, :w]
+    h = min(real.shape[1], mrender.shape[1], calib_synth.shape[1], bundle.shape[1])
+    w = min(real.shape[2], mrender.shape[2], calib_synth.shape[2], bundle.shape[2])
+    real, mrender = real[:, :h, :w], mrender[:, :h, :w]
+    calib_synth, bundle = calib_synth[:, :h, :w], bundle[:, :h, :w]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6.3), facecolor="white",
+    panels = [
+        (real, f"real\n{bounds[2]-bounds[0]:.0f}×{bounds[3]-bounds[1]:.0f} µm "
+               f"@ ({bounds[0]:.0f},{bounds[1]:.0f})"),
+        (mrender, f"m.render (renderer float,\npre-calibration) — {n_anchors} anchors"),
+        (calib_synth, f"synth bundle (calib '{calib['mode']}'\n→ what explain writes now)"),
+        (bundle, "saved bundle on disk\n(uint16 → LUT-norm)"),
+    ]
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6.3), facecolor="white",
                              gridspec_kw={"wspace": 0.02})
-    axes[0].imshow(composite_rgb(real, ch_names))
-    axes[0].set_title(f"real\n{bounds[2]-bounds[0]:.0f}×{bounds[3]-bounds[1]:.0f} µm "
-                      f"@ ({bounds[0]:.0f},{bounds[1]:.0f})",
-                      fontsize=10, fontweight="bold")
-    axes[1].imshow(composite_rgb(mrender, ch_names))
-    axes[1].set_title(f"m.render (renderer float)\n{n_anchors} anchors",
-                      fontsize=10, fontweight="bold")
-    axes[2].imshow(composite_rgb(bundle, ch_names))
-    axes[2].set_title("saved bundle (uint16 → LUT-norm)\n[lut_native + noise]",
-                      fontsize=10, fontweight="bold")
-    for ax in axes:
+    for ax, (img, title) in zip(axes, panels):
+        ax.imshow(composite_rgb(img, ch_names))
+        ax.set_title(title, fontsize=10, fontweight="bold")
         ax.axis("off")
-    plt.subplots_adjust(left=0.003, right=0.997, top=0.94, bottom=0.005)
+    # panel2≈3 ⇒ render path faithful; 3≈4 ⇒ saved bundle matches current
+    # calibration; 1≈3 ⇒ render+calibration realistic.
+    plt.subplots_adjust(left=0.003, right=0.997, top=0.92, bottom=0.005)
     plt.savefig(str(out_path), facecolor="white", dpi=120, bbox_inches="tight",
                 pad_inches=0.05)
     plt.close(fig)
     return Path(out_path)
+
+
+def _lut_norm_uint16(u16, display_lut) -> np.ndarray:
+    """LUT-normalize a (C,H,W) uint16 morphology array into [0,1] display
+    space, matching how the real / saved-bundle panels are normalized."""
+    chans = (display_lut or {}).get("channels", []) if display_lut else []
+    out = []
+    for ci in range(u16.shape[0]):
+        c = u16[ci].astype(np.float32)
+        if ci < len(chans):
+            lo = float(chans[ci].get("lo", 0.0)); hi = float(chans[ci].get("hi", 1.0))
+            c = (c - lo) / max(hi - lo, 1e-6)
+        else:
+            p99 = float(np.percentile(c[c > 0], 99)) if (c > 0).any() else 1.0
+            c = c / p99 if p99 > 0 else c
+        out.append(np.clip(c, 0, 1))
+    return np.stack(out, axis=0)
 
 
 def main(argv=None) -> None:

@@ -94,20 +94,20 @@ def render_region_via_cli_path(
     Returns:
         {"image": (C, H, W) float32, "n_anchors": int,
          "n_proposed": int, "scenes": ..., "bounds_um": ...}
+
+    Thin wrapper over the shared :func:`render_region` (calibration=None →
+    raw renderer float) so the diagnostic renders through the exact same path
+    production uses, instead of a parallel build_scene call that can drift.
     """
-    from .scene_pipeline import build_scene
-    rng = rng or np.random.default_rng(0)
-    res = build_scene(
-        model, str(bundle_path), scene_bounds_um=bounds,
-        add_ghosts=add_ghosts,
-        add_transcript_proposed=add_transcript_proposed,
-        rng=rng, progress=False,
-        align_to_tile_origin=False, overlap_um=6.0,
-    )
+    from .render_region import render_region
+    res = render_region(
+        model, bundle_path, bounds, calibration=None,
+        add_ghosts=add_ghosts, add_transcript_proposed=add_transcript_proposed,
+        rng=rng)
     return {
-        "image": res["stitched_image"].astype(np.float32, copy=False),
-        "n_anchors": int(res["n_anchor_cells"]),
-        "n_proposed": int(res.get("n_transcript_proposed", 0)),
+        "image": res["float_image"],
+        "n_anchors": res["n_anchors"],
+        "n_proposed": res["n_transcript_proposed"],
         "scenes": res["scenes"],
         "bounds_um": res["scene_bounds_um"],
     }

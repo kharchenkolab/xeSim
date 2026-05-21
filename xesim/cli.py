@@ -471,31 +471,32 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
     from .scene_2d.bundle_writer import write_bundle
     from .scene_2d.scene_pipeline import build_scene
 
+    from .scene_2d.render_region import resolve_render_calibration
     nf = _resolve_noise_fraction(args.noise_fraction, args.bundle)
-    target_intensity, target_quantiles, calib_mode = _resolve_intensity_calibration(
-        args.intensity_calibration, args.bundle, model)
+    # Single source of truth for calibration config (display LUT + per-channel
+    # sensor noise + histmatch/scale targets), shared with the diagnostics so
+    # the A3 panel reflects exactly what this path writes.
+    calib = resolve_render_calibration(
+        model, args.bundle, model_dir=args.model, mode=args.intensity_calibration)
+    target_intensity = calib["target_stats"]
+    target_quantiles = calib["target_quantiles"]
+    calib_mode = calib["mode"]
+    display_lut = calib["display_lut"]
+    if target_intensity is not None:
+        print(f"[explain] Intensity calibration '{calib_mode}' tuned from real bundle")
+    elif target_quantiles is not None:
+        print(f"[explain] Intensity calibration 'histmatch': "
+              f"{len(target_quantiles)} channel quantile tables")
+    if display_lut is not None and display_lut.get("noise_stats"):
+        print(f"[explain] calibrated noise: "
+              f"{[(n.get('read_std',0), n.get('shot_k',0)) for n in display_lut['noise_stats']]}")
 
     if args.scene_first:
         result = _explain_multi_scene_first(model, args, bounds, rng, nf,
                                                 target_intensity, target_quantiles, calib_mode)
     else:
-        # The streaming writer needs to know about display_lut +
-        # channel_names ahead of time, since it does in-line uint16
-        # calibration during tile finalize. Look those up up-front.
-        from .scene_2d.render_tile import load_model_display_lut
-        from .scene_2d.intensity import calibrate_noise_stats
-        _display_lut = load_model_display_lut(str(args.model))
-        if _display_lut is not None and args.bundle:
-            try:
-                import os as _os
-                if _os.environ.get("XESIM_DISABLE_NOISE", "").strip() == "1":
-                    _display_lut["noise_stats"] = []   # parity-test mode
-                else:
-                    _display_lut["noise_stats"] = calibrate_noise_stats(
-                        args.bundle, display_lut=_display_lut)
-            except Exception:
-                pass
-        _channel_names = list(model.manifest.get("channel_names") or [])
+        _channel_names = calib["channel_names"]
+        _display_lut = display_lut
         result = build_scene(
             model, args.bundle,
             scene_bounds_um=bounds,
@@ -549,29 +550,9 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
         "stamp_transcripts": bool(args.stamp_transcripts),
     }
 
-    # Pass the model's display LUT so the bundle writer maps renderer
-    # output → uint16 in the same intensity space the renderer was
-    # trained in (lut_native mode preserves channel ratios + matches
-    # real Xenium scale, instead of the lossy per-channel p99→4095).
-    # Also auto-calibrate per-channel noise (Gaussian read + Poisson shot)
-    # from the real bundle so synth's dark regions have the same noise
-    # texture as real (the deterministic renderer produces zero variance).
-    from .scene_2d.render_tile import load_model_display_lut
-    from .scene_2d.intensity import calibrate_noise_stats
-    display_lut = load_model_display_lut(str(args.model))
-    if display_lut is not None and args.bundle:
-        try:
-            import os as _os
-            if _os.environ.get("XESIM_DISABLE_NOISE", "").strip() == "1":
-                display_lut["noise_stats"] = []
-                print(f"[explain] noise injection disabled (XESIM_DISABLE_NOISE=1)")
-            else:
-                display_lut["noise_stats"] = calibrate_noise_stats(
-                    args.bundle, display_lut=display_lut)
-                print(f"[explain] calibrated noise: "
-                        f"{[(n.get('read_std',0), n.get('shot_k',0)) for n in display_lut['noise_stats']]}")
-        except Exception as e:
-            print(f"[explain] noise calibration unavailable ({e}); skipping noise injection")
+    # display_lut (LUT-native mapping + calibrated sensor noise) was resolved
+    # once up-front via resolve_render_calibration — reused here so the writer
+    # calibrates in the same space the streaming render did.
     print(f"[explain] Writing bundle → {args.out}")
     try:
         # When the streaming writer ran inside build_scene, the
@@ -697,20 +678,19 @@ def _resolve_noise_fraction(arg_value, bundle_path):
 
 
 def _resolve_intensity_calibration(mode, bundle_path, model):
-    """Tune per-channel calibration stats for the chosen mode."""
-    from .scene_2d.bundle_writer import auto_tune_intensity_stats
-    from .scene_2d.intensity import auto_tune_intensity_quantiles
-    channel_names = list(model.manifest.get("channel_names") or [])
-    target_stats = None
-    target_quantiles = None
-    if mode in ("scale", "match2"):
-        target_stats = auto_tune_intensity_stats(bundle_path, channel_names)
-        stat_str = ", ".join(f"{n}: p50={p50:.0f} p99.5={p99:.0f}"
-                              for n, (p50, p99) in target_stats.items())
-        print(f"[explain] Intensity calibration '{mode}' tuned from real "
-              f"bundle: {stat_str}")
-    elif mode == "histmatch":
-        target_quantiles = auto_tune_intensity_quantiles(bundle_path, channel_names)
+    """Tune per-channel calibration targets for the chosen mode.
+
+    Thin wrapper over the shared resolve_render_calibration (single source of
+    truth) for callers that only need the targets, not the display LUT (the
+    single-tile path)."""
+    from .scene_2d.render_region import resolve_render_calibration
+    calib = resolve_render_calibration(model, bundle_path, model_dir=None, mode=mode)
+    target_stats, target_quantiles = calib["target_stats"], calib["target_quantiles"]
+    if target_stats is not None:
+        print(f"[explain] Intensity calibration '{mode}' tuned from real bundle: "
+              + ", ".join(f"{n}: p50={p50:.0f} p99.5={p99:.0f}"
+                          for n, (p50, p99) in target_stats.items()))
+    elif target_quantiles is not None:
         print(f"[explain] Intensity calibration 'histmatch': "
               f"tuned {len(target_quantiles)} channel quantile tables")
     else:
