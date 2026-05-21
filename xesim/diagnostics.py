@@ -570,13 +570,13 @@ def _plot_midscale_regions(bundle_path: Path, synth_dir: Path,
 
 def _plot_tile_3panels(bundle_path: Path, synth_dir: Path, model_dir: Path,
                           out_dir: Path, regions) -> list[Path]:
-    """A3: small bench-scale 3-panel real | m.render | saved bundle."""
+    """A3: small bench-scale 3-panel real | m.render | saved bundle.
+
+    Runs the packaged region-3panel module as a subprocess (``python -m
+    xesim.scene_2d.region_3panel``) so the model load + CUDA context that
+    panel 2 (m.render) needs live in their own process and are freed after —
+    keeping the GPU dependency out of the parent diagnostics process."""
     import subprocess
-    diag_script = Path(__file__).resolve().parent.parent / "misc" / "diagnostics_region_3panel.py"
-    if not diag_script.exists():
-        _skip("A3", f"render subprocess not found: {diag_script} "
-              "(gitignored; not present on clean checkouts)")
-        return []
     if not regions:
         _skip("A3", "no in-bounds bench regions for this scope")
         return []
@@ -586,7 +586,7 @@ def _plot_tile_3panels(bundle_path: Path, synth_dir: Path, model_dir: Path,
         out = Path(out_dir) / f"scale_A3_{label}.png"
         try:
             subprocess.run(
-                [sys.executable, str(diag_script),
+                [sys.executable, "-m", "xesim.scene_2d.region_3panel",
                  "--bundle", str(bundle_path),
                  "--synth", str(synth_dir),
                  "--model", str(model_dir),
@@ -595,8 +595,8 @@ def _plot_tile_3panels(bundle_path: Path, synth_dir: Path, model_dir: Path,
                 check=True, capture_output=True, text=True)
             written.append(out)
         except subprocess.CalledProcessError as e:
-            print(f"[diagnostics] tile {label} failed: {e.stderr.strip()[-200:]}",
-                  file=sys.stderr)
+            _skip("A3", f"region {label} render failed: "
+                  f"{e.stderr.strip()[-200:]}")
     return written
 
 
