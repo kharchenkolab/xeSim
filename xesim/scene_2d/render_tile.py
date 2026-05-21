@@ -47,7 +47,14 @@ def real_tile_image(
         if not bundle.morphology_focus_paths:
             return None
         xmin, xmax, ymin, ymax = tile_bounds_um
-        crop = CropBox(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax,
+        # tile_bounds_um are GLOBAL coords. A region/whole bundle's morphology
+        # image has its pixel (0,0) at the bundle's own origin — (0,0) for a
+        # full bundle, but the region's (xmin,ymin) for a region explain
+        # bundle. Subtract that origin so global bounds map to the right
+        # pixels (without this, region bundles crop shifted / out-of-bounds).
+        ox, oy = bundle_origin_um(bundle_path)
+        crop = CropBox(xmin=xmin - ox, xmax=xmax - ox,
+                        ymin=ymin - oy, ymax=ymax - oy,
                         crop_id="real_tile")
         reader = ImageStackReader(bundle.morphology_focus_paths, bundle.pixel_size)
         img = np.asarray(reader.read(crop), dtype=np.float32)
@@ -72,6 +79,39 @@ def real_tile_image(
         return None
 
 
+def bundle_origin_um(bundle_path: str | Path) -> tuple[float, float]:
+    """Global-µm origin (xmin, ymin) of a bundle's morphology image.
+
+    A whole-bundle render has origin (0, 0); a region explain bundle's
+    morphology covers only the region, so its pixel (0,0) sits at the
+    region's (xmin, ymin). Read from experiment.xenium tile_bounds_um.
+    Returns (0.0, 0.0) when absent (treat as full-bundle / global).
+    """
+    try:
+        m = json.loads((Path(bundle_path) / "experiment.xenium").read_text())
+        tb = m.get("tile_bounds_um")
+        if tb and len(tb) >= 2:
+            return float(tb[0]), float(tb[1])
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def bundle_bounds_um(bundle_path: str | Path) -> tuple[float, float, float, float] | None:
+    """Global-µm bounds (xmin, ymin, xmax, ymax) of a bundle's rendered
+    extent, from experiment.xenium tile_bounds_um. None if unavailable.
+    Used by diagnostics to restrict example selection to what was actually
+    rendered (so region bundles don't pick out-of-region examples)."""
+    try:
+        m = json.loads((Path(bundle_path) / "experiment.xenium").read_text())
+        tb = m.get("tile_bounds_um")
+        if tb and len(tb) == 4:
+            return tuple(float(v) for v in tb)  # type: ignore[return-value]
+    except Exception:
+        pass
+    return None
+
+
 def load_model_display_lut(model_dir: str | Path) -> dict | None:
     """Load the display LUT from a model's canonical/manifest.json (or
     via symlink). Resolves symlinks so model dirs that share a canonical
@@ -91,4 +131,5 @@ def load_model_display_lut(model_dir: str | Path) -> dict | None:
         return None
 
 
-__all__ = ["render_tile", "real_tile_image", "load_model_display_lut"]
+__all__ = ["render_tile", "real_tile_image", "load_model_display_lut",
+           "bundle_origin_um", "bundle_bounds_um"]
