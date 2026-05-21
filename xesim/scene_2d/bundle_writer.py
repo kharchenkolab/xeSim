@@ -119,13 +119,19 @@ def _build_transcripts_df(
         y_local = mols["y"].to_numpy(dtype=np.float64)
         x_global = (x_local + xmin).astype(np.float32)
         y_global = (y_local + ymin).astype(np.float32)
-        px = x_local / sc.pixel_size
-        py = y_local / sc.pixel_size
-        nuc_lbl = sc.mech_scene.nucleus_label
-        h, w = nuc_lbl.shape
-        px_i = np.clip(np.round(px).astype(np.int64), 0, w - 1)
-        py_i = np.clip(np.round(py).astype(np.int64), 0, h - 1)
-        overlaps_nuc = (nuc_lbl[py_i, px_i] > 0).astype(np.uint8)
+        # overlaps_nucleus: precomputed per-tile while the mask was alive
+        # (mask-free streaming path), else computed here from the resident
+        # nucleus mask (legacy path).
+        if "overlaps_nucleus" in mols.columns:
+            overlaps_nuc = mols["overlaps_nucleus"].to_numpy(dtype=np.uint8)
+        else:
+            px = x_local / sc.pixel_size
+            py = y_local / sc.pixel_size
+            nuc_lbl = sc.mech_scene.nucleus_label
+            h, w = nuc_lbl.shape
+            px_i = np.clip(np.round(px).astype(np.int64), 0, w - 1)
+            py_i = np.clip(np.round(py).astype(np.int64), 0, h - 1)
+            overlaps_nuc = (nuc_lbl[py_i, px_i] > 0).astype(np.uint8)
 
         n_mol = len(mols)
         z_loc = (mols["z"].to_numpy(dtype=np.float32)
@@ -228,12 +234,97 @@ def _polygons_to_long_df(
     return df
 
 
+def extract_scene_geometry(scene: Scene2D) -> dict[str, dict]:
+    """Extract per-cell geometry + contour polygons from one tile scene's
+    rasterized label masks, keyed by ``cell_id``.
+
+    This is the per-tile counterpart of the mask reads that
+    ``_collect_polygons`` / ``_build_real_cells_df`` / ``_build_cells_df``
+    do in bulk at write time. Running it as each tile finishes lets the
+    pipeline free the (large) label masks immediately instead of holding
+    every tile's masks in RAM until the bundle write — the dominant term
+    in parent memory on big bundles. The math is copied verbatim from
+    those functions so the resulting tables are byte-identical (verified
+    by tests in test_metadata_streaming.py).
+
+    Returns ``{cell_id: {"cx","cy","area","nuc_area","cell_poly","nuc_poly"}}``
+    where ``*_poly`` is ``(xs_um, ys_um)`` float32 arrays (or ``None`` if no
+    contour could be extracted). Covers anchors AND ghosts; the caller
+    decides per-cell (via the cell's own ``is_ghost``) where each lands.
+    """
+    from skimage.measure import find_contours
+    from scipy.ndimage import find_objects as _find_objects
+
+    mech = scene.mech_scene
+    cell_lbl = mech.cell_label
+    nuc_lbl = mech.nucleus_label
+    xmin, _, ymin, _ = scene.tile_bounds_um
+    psz = scene.pixel_size
+
+    out: dict[str, dict] = {}
+    if cell_lbl is None or cell_lbl.size == 0:
+        return out
+
+    max_lbl = int(cell_lbl.max())
+    cell_slices = _find_objects(cell_lbl) if max_lbl > 0 else []
+    if nuc_lbl is not None and nuc_lbl.size and int(nuc_lbl.max()) > 0:
+        nuc_slices = _find_objects(nuc_lbl)
+    else:
+        nuc_slices = []
+
+    def _contour(label_arr, slices, lbl):
+        sl = slices[lbl - 1] if 1 <= lbl <= len(slices) else None
+        if sl is None:
+            return None
+        sub = label_arr[sl] == lbl
+        if not sub.any():
+            return None
+        padded = np.pad(sub.astype(np.uint8), 1, mode="constant")
+        contours = find_contours(padded, level=0.5)
+        if not contours:
+            return None
+        contour = max(contours, key=len)
+        y_off, x_off = sl[0].start, sl[1].start
+        ys_px = contour[:, 0] - 1 + y_off
+        xs_px = contour[:, 1] - 1 + x_off
+        return (np.asarray(xmin + xs_px * psz, dtype=np.float32),
+                np.asarray(ymin + ys_px * psz, dtype=np.float32))
+
+    for cell in mech.cells:
+        lbl = int(cell.label)
+        rec: dict = {"cx": None, "cy": None, "area": 0.0, "nuc_area": 0.0,
+                     "cell_poly": None, "nuc_poly": None}
+        # centroid + area (from cell mask)
+        sl = cell_slices[lbl - 1] if 1 <= lbl <= len(cell_slices) else None
+        if sl is not None:
+            sub = cell_lbl[sl] == lbl
+            if sub.any():
+                y_off, x_off = sl[0].start, sl[1].start
+                cys, cxs = np.where(sub)
+                rec["cx"] = float(xmin + (cxs.mean() + x_off) * psz)
+                rec["cy"] = float(ymin + (cys.mean() + y_off) * psz)
+                rec["area"] = float(int(sub.sum()) * psz * psz)
+        # nucleus area
+        if nuc_slices and 1 <= lbl <= len(nuc_slices):
+            nsl = nuc_slices[lbl - 1]
+            if nsl is not None:
+                nsub = nuc_lbl[nsl] == lbl
+                if nsub.any():
+                    rec["nuc_area"] = float(int(nsub.sum()) * psz * psz)
+        # contour polygons
+        rec["cell_poly"] = _contour(cell_lbl, cell_slices, lbl)
+        rec["nuc_poly"] = _contour(nuc_lbl, nuc_slices, lbl)
+        out[cell.cell_id] = rec
+    return out
+
+
 def _collect_polygons(
     scenes: list[Scene2D],
     *,
     kind: str,         # "cell" or "nucleus"
     is_ghost: bool,    # whether to collect ghost or anchor cells
     real_polys_lookup: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    geom_stash: dict[str, dict] | None = None,
 ) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """Pull polygon (cell_id, xs, ys) tuples across all scenes.
 
@@ -241,24 +332,31 @@ def _collect_polygons(
     (``real_polys_lookup: cell_id → (xs_um, ys_um)``) to avoid the
     tile-boundary clipping that affects tile-local contour extraction.
     Cells not in the lookup (and ghosts / tx-proposed cells) fall back to
-    contour extraction from the tile's ``cell_label`` mask.
+    contour extraction.
 
-    Polygons are reconstructed from the rasterized label masks via contour
-    extraction when the lookup misses.
+    Contour polygons come from one of two sources, in order:
+      * ``geom_stash`` (cell_id → {"cell_poly","nuc_poly", ...}), the
+        per-tile extraction produced by :func:`extract_scene_geometry`
+        before the masks were freed. Preferred when present.
+      * direct ``find_contours`` on the scene's still-resident label mask
+        (legacy path, used by tests / single-scene callers).
     """
     from skimage.measure import find_contours
     from scipy.ndimage import find_objects as _find_objects
 
+    poly_key = "cell_poly" if kind == "cell" else "nuc_poly"
     out: list[tuple[str, np.ndarray, np.ndarray]] = []
     for sc in scenes:
         label_arr = (sc.mech_scene.cell_label
                        if kind == "cell" else sc.mech_scene.nucleus_label)
         xmin, _, ymin, _ = sc.tile_bounds_um
         psz = sc.pixel_size
-        if label_arr is None or label_arr.size == 0:
-            continue
-        max_lbl = int(label_arr.max())
-        slices = _find_objects(label_arr) if max_lbl > 0 else []
+        have_mask = label_arr is not None and label_arr.size > 0
+        if have_mask:
+            max_lbl = int(label_arr.max())
+            slices = _find_objects(label_arr) if max_lbl > 0 else []
+        else:
+            slices = []
         # Map label → cell_id from the mech_scene
         for cell in sc.mech_scene.cells:
             if bool(cell.provenance.get("is_ghost", False)) != is_ghost:
@@ -269,6 +367,14 @@ def _collect_polygons(
                 out.append((cell.cell_id,
                               xs_um.astype(np.float32),
                               ys_um.astype(np.float32)))
+                continue
+            if geom_stash is not None:
+                rec = geom_stash.get(cell.cell_id)
+                poly = rec.get(poly_key) if rec else None
+                if poly is not None:
+                    out.append((cell.cell_id, poly[0], poly[1]))
+                continue
+            if not have_mask:
                 continue
             lbl = int(cell.label)
             sl = slices[lbl - 1] if 1 <= lbl <= len(slices) else None
@@ -324,6 +430,7 @@ def _load_real_polys_lookup(real_bundle_path: str | Path,
 def _build_real_cells_df(
     scenes: list[Scene2D],
     transcripts_df: pd.DataFrame,
+    geom_stash: dict[str, dict] | None = None,
 ) -> pd.DataFrame:
     """Build the public ``cells.parquet`` table — anchors only, matching the
     real Xenium schema column-for-column.
@@ -333,6 +440,9 @@ def _build_real_cells_df(
     deprecated_codeword_counts, total_counts, cell_area, nucleus_area.
 
     Ghosts are excluded (they live in ``ground_truth/cells_synth.parquet``).
+
+    Centroid/area come from ``geom_stash`` (per-tile extraction, masks
+    already freed) when provided, else from the still-resident label masks.
     """
     counts: dict[str, int] = {}
     if len(transcripts_df) > 0:
@@ -350,34 +460,44 @@ def _build_real_cells_df(
         psz = sc.pixel_size
         cell_lbl = sc.mech_scene.cell_label
         nuc_lbl = sc.mech_scene.nucleus_label
-        max_lbl = int(cell_lbl.max()) if cell_lbl.size else 0
-        cell_slices = _find_objects(cell_lbl) if max_lbl > 0 else []
-        if nuc_lbl is not None and nuc_lbl.size and int(nuc_lbl.max()) > 0:
-            nuc_slices = _find_objects(nuc_lbl)
-        else:
-            nuc_slices = []
+        use_stash = geom_stash is not None
+        if not use_stash:
+            max_lbl = int(cell_lbl.max()) if cell_lbl.size else 0
+            cell_slices = _find_objects(cell_lbl) if max_lbl > 0 else []
+            if nuc_lbl is not None and nuc_lbl.size and int(nuc_lbl.max()) > 0:
+                nuc_slices = _find_objects(nuc_lbl)
+            else:
+                nuc_slices = []
         for cell in sc.mech_scene.cells:
             if bool(cell.provenance.get("is_ghost", False)):
                 continue
-            lbl = int(cell.label)
-            sl = cell_slices[lbl - 1] if 1 <= lbl <= len(cell_slices) else None
-            if sl is None:
-                continue
-            sub = cell_lbl[sl] == lbl
-            if not sub.any():
-                continue
-            y_off, x_off = sl[0].start, sl[1].start
-            cys, cxs = np.where(sub)
-            cx_um = xmin + (cxs.mean() + x_off) * psz
-            cy_um = ymin + (cys.mean() + y_off) * psz
-            cell_area_um2 = float(sub.sum()) * psz * psz
-            nuc_area_um2 = 0.0
-            if nuc_lbl is not None and 1 <= lbl <= len(nuc_slices):
-                nsl = nuc_slices[lbl - 1]
-                if nsl is not None:
-                    nsub = nuc_lbl[nsl] == lbl
-                    if nsub.any():
-                        nuc_area_um2 = float(nsub.sum()) * psz * psz
+            if use_stash:
+                rec = geom_stash.get(cell.cell_id)
+                if rec is None or rec["cx"] is None:
+                    continue
+                cx_um, cy_um = rec["cx"], rec["cy"]
+                cell_area_um2 = rec["area"]
+                nuc_area_um2 = rec["nuc_area"]
+            else:
+                lbl = int(cell.label)
+                sl = cell_slices[lbl - 1] if 1 <= lbl <= len(cell_slices) else None
+                if sl is None:
+                    continue
+                sub = cell_lbl[sl] == lbl
+                if not sub.any():
+                    continue
+                y_off, x_off = sl[0].start, sl[1].start
+                cys, cxs = np.where(sub)
+                cx_um = xmin + (cxs.mean() + x_off) * psz
+                cy_um = ymin + (cys.mean() + y_off) * psz
+                cell_area_um2 = float(sub.sum()) * psz * psz
+                nuc_area_um2 = 0.0
+                if nuc_lbl is not None and 1 <= lbl <= len(nuc_slices):
+                    nsl = nuc_slices[lbl - 1]
+                    if nsl is not None:
+                        nsub = nuc_lbl[nsl] == lbl
+                        if nsub.any():
+                            nuc_area_um2 = float(nsub.sum()) * psz * psz
             n_mol = counts.get(cell.cell_id, 0)
             rows.append({
                 "cell_id": cell.cell_id,
@@ -417,7 +537,8 @@ def _build_real_cells_df(
     return df
 
 
-def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
+def _build_cells_df(scenes: list[Scene2D],
+                    geom_stash: dict[str, dict] | None = None) -> pd.DataFrame:
     """Build a per-cell metadata table for ground_truth/cells_synth.parquet.
 
     EXCLUDES ghost cells — ghosts represent uncertain noise sources, not
@@ -435,6 +556,9 @@ def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
     These columns live in ground_truth/cells_synth.parquet (xeSim-specific)
     and are NOT added to the public 10x-format cells.parquet (kept
     schema-clean for Xenium Explorer / downstream consumers).
+
+    Centroid/area come from ``geom_stash`` (per-tile extraction, masks
+    already freed) when provided, else from the still-resident label masks.
     """
     from scipy.ndimage import find_objects as _find_objects
     from ..cell_type_resolver import evidence_to_json
@@ -444,24 +568,32 @@ def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
         xmin, _, ymin, _ = sc.tile_bounds_um
         psz = sc.pixel_size
         cell_lbl = sc.mech_scene.cell_label
-        max_lbl = int(cell_lbl.max()) if cell_lbl.size else 0
-        cell_slices = _find_objects(cell_lbl) if max_lbl > 0 else []
+        use_stash = geom_stash is not None
+        if not use_stash:
+            max_lbl = int(cell_lbl.max()) if cell_lbl.size else 0
+            cell_slices = _find_objects(cell_lbl) if max_lbl > 0 else []
         for cell in sc.mech_scene.cells:
             # Skip ghosts — they're noise-source emitters, not confirmed cells.
             if bool(cell.provenance.get("is_ghost", False)):
                 continue
-            lbl = int(cell.label)
-            sl = cell_slices[lbl - 1] if 1 <= lbl <= len(cell_slices) else None
-            if sl is None:
-                continue
-            sub = cell_lbl[sl] == lbl
-            if not sub.any():
-                continue
-            y_off, x_off = sl[0].start, sl[1].start
-            ys, xs = np.where(sub)
-            cx_um = xmin + (xs.mean() + x_off) * psz
-            cy_um = ymin + (ys.mean() + y_off) * psz
-            n_px = int(sub.sum())
+            if use_stash:
+                rec = geom_stash.get(cell.cell_id)
+                if rec is None or rec["cx"] is None:
+                    continue
+                cx_um, cy_um, area_um2 = rec["cx"], rec["cy"], rec["area"]
+            else:
+                lbl = int(cell.label)
+                sl = cell_slices[lbl - 1] if 1 <= lbl <= len(cell_slices) else None
+                if sl is None:
+                    continue
+                sub = cell_lbl[sl] == lbl
+                if not sub.any():
+                    continue
+                y_off, x_off = sl[0].start, sl[1].start
+                ys, xs = np.where(sub)
+                cx_um = xmin + (xs.mean() + x_off) * psz
+                cy_um = ymin + (ys.mean() + y_off) * psz
+                area_um2 = float(int(sub.sum()) * psz * psz)
             # Pull resolver-stamped provenance, if present. Cells from a
             # pre-refactor run (or that fell through all four tiers) get
             # `None` / 0.0 / "{}" — Phase 4 of the refactor makes the
@@ -473,7 +605,7 @@ def _build_cells_df(scenes: list[Scene2D]) -> pd.DataFrame:
                 "is_ghost": bool(cell.provenance.get("is_ghost", False)),
                 "centroid_x": float(cx_um),
                 "centroid_y": float(cy_um),
-                "area_um2": float(n_px * psz * psz),
+                "area_um2": float(area_um2),
                 "source": cell.source,
                 "cell_type_source": (res["source"] if res else None),
                 "cell_type_confidence": (float(res["confidence"])
@@ -873,8 +1005,16 @@ def write_bundle(
     n_pyramid_levels: int = 8,
     real_bundle_path: str | Path | None = None,
     display_lut: dict | None = None,
+    geom_stash: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """Write a synthetic Xenium-compatible bundle directory.
+
+    ``geom_stash`` (cell_id → per-cell geometry + contour polygons, from
+    :func:`extract_scene_geometry` during tile build) lets the writer build
+    boundaries/cells tables without re-reading the per-tile label masks —
+    which the pipeline frees as soon as each tile is extracted to keep
+    parent RAM bounded on large bundles. When ``None``, geometry is read
+    from the scenes' still-resident masks (legacy / small-run path).
 
     Parameters
     ----------
@@ -939,15 +1079,24 @@ def write_bundle(
 
     written: dict[str, Any] = {"output_dir": str(out_dir)}
 
+    # CSV.gz mirror writes are expensive (~25% of bundle-write wall time
+    # on whole-pancreas profile via py-spy). They duplicate .parquet
+    # data 1:1 for tools that don't speak Arrow. Set XESIM_SKIP_CSV_GZ=1
+    # to skip them (parquet covers all data; synth bundles consumed
+    # directly by xeSim diagnostics / Xenium Explorer don't need csv).
+    import os as _os
+    _skip_csv = _os.environ.get("XESIM_SKIP_CSV_GZ", "").strip() == "1"
+
     # 1. Transcripts (with TRUE cell_id; ghost-cell molecules carry ghost IDs)
     transcripts_df = _build_transcripts_df(scenes_list, rng=rng)
     transcripts_df.to_parquet(out_dir / "transcripts.parquet", index=False)
-    transcripts_df.to_csv(out_dir / "transcripts.csv.gz",
-                            index=False, compression="gzip")
+    if not _skip_csv:
+        transcripts_df.to_csv(out_dir / "transcripts.csv.gz",
+                                index=False, compression="gzip")
     written["transcripts"] = {
         "n_rows": int(len(transcripts_df)),
         "parquet": str(out_dir / "transcripts.parquet"),
-        "csv_gz": str(out_dir / "transcripts.csv.gz"),
+        **({"csv_gz": str(out_dir / "transcripts.csv.gz")} if not _skip_csv else {}),
     }
 
     # 2. Cell boundaries — anchors only (ground-truth polygons).
@@ -973,29 +1122,32 @@ def write_bundle(
                   f"falling back to tile-local contour extraction.")
     anchor_cell_polys = _collect_polygons(
         scenes_list, kind="cell", is_ghost=False,
-        real_polys_lookup=real_cell_lookup or None)
+        real_polys_lookup=real_cell_lookup or None, geom_stash=geom_stash)
     anchor_nuc_polys = _collect_polygons(
         scenes_list, kind="nucleus", is_ghost=False,
-        real_polys_lookup=real_nuc_lookup or None)
+        real_polys_lookup=real_nuc_lookup or None, geom_stash=geom_stash)
     cells_df = _polygons_to_long_df(anchor_cell_polys)
     nucs_df = _polygons_to_long_df(anchor_nuc_polys)
     cells_df.to_parquet(out_dir / "cell_boundaries.parquet", index=False)
-    cells_df.to_csv(out_dir / "cell_boundaries.csv.gz",
-                      index=False, compression="gzip")
     nucs_df.to_parquet(out_dir / "nucleus_boundaries.parquet", index=False)
-    nucs_df.to_csv(out_dir / "nucleus_boundaries.csv.gz",
-                     index=False, compression="gzip")
+    if not _skip_csv:
+        cells_df.to_csv(out_dir / "cell_boundaries.csv.gz",
+                          index=False, compression="gzip")
+        nucs_df.to_csv(out_dir / "nucleus_boundaries.csv.gz",
+                         index=False, compression="gzip")
     written["cell_boundaries"] = {"n_anchor_cells": int(cells_df["cell_id"].nunique())}
 
     # 2b. cells.parquet + cells.csv.gz — public per-cell metadata (anchors only)
-    real_cells_df = _build_real_cells_df(scenes_list, transcripts_df)
+    real_cells_df = _build_real_cells_df(scenes_list, transcripts_df,
+                                         geom_stash=geom_stash)
     real_cells_df.to_parquet(out_dir / "cells.parquet", index=False)
-    real_cells_df.to_csv(out_dir / "cells.csv.gz",
-                           index=False, compression="gzip")
+    if not _skip_csv:
+        real_cells_df.to_csv(out_dir / "cells.csv.gz",
+                               index=False, compression="gzip")
     written["cells"] = {
         "n_cells": int(len(real_cells_df)),
         "parquet": str(out_dir / "cells.parquet"),
-        "csv_gz": str(out_dir / "cells.csv.gz"),
+        **({"csv_gz": str(out_dir / "cells.csv.gz")} if not _skip_csv else {}),
     }
 
     # 3. Morphology image(s) — calibrated uint16 + 8-level pyramid + 4 focus files
@@ -1123,12 +1275,14 @@ def write_bundle(
     prov_df.to_parquet(gt_dir / "molecule_provenance.parquet", index=False)
 
     # 6b. Cells table (anchor + ghost with is_ghost flag)
-    cells_meta = _build_cells_df(scenes_list)
+    cells_meta = _build_cells_df(scenes_list, geom_stash=geom_stash)
     cells_meta.to_parquet(gt_dir / "cells_synth.parquet", index=False)
 
     # 6c. Ghost cell boundaries (kept separate so the public bundle is "clean")
-    ghost_cell_polys = _collect_polygons(scenes_list, kind="cell", is_ghost=True)
-    ghost_nuc_polys = _collect_polygons(scenes_list, kind="nucleus", is_ghost=True)
+    ghost_cell_polys = _collect_polygons(scenes_list, kind="cell", is_ghost=True,
+                                         geom_stash=geom_stash)
+    ghost_nuc_polys = _collect_polygons(scenes_list, kind="nucleus", is_ghost=True,
+                                        geom_stash=geom_stash)
     _polygons_to_long_df(ghost_cell_polys).to_parquet(
         gt_dir / "ghost_cell_boundaries.parquet", index=False)
     _polygons_to_long_df(ghost_nuc_polys).to_parquet(

@@ -494,6 +494,23 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
         result = _explain_multi_scene_first(model, args, bounds, rng, nf,
                                                 target_intensity, target_quantiles, calib_mode)
     else:
+        # The streaming writer needs to know about display_lut +
+        # channel_names ahead of time, since it does in-line uint16
+        # calibration during tile finalize. Look those up up-front.
+        from .scene_2d.render_tile import load_model_display_lut
+        from .scene_2d.intensity import calibrate_noise_stats
+        _display_lut = load_model_display_lut(str(args.model))
+        if _display_lut is not None and args.bundle:
+            try:
+                import os as _os
+                if _os.environ.get("XESIM_DISABLE_NOISE", "").strip() == "1":
+                    _display_lut["noise_stats"] = []   # parity-test mode
+                else:
+                    _display_lut["noise_stats"] = calibrate_noise_stats(
+                        args.bundle, display_lut=_display_lut)
+            except Exception:
+                pass
+        _channel_names = list(model.manifest.get("channel_names") or [])
         result = build_scene(
             model, args.bundle,
             scene_bounds_um=bounds,
@@ -512,6 +529,9 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
             device=args.device,
             emission_backend=getattr(args, "emission_backend", "legacy"),
             stpuppeteer_config=getattr(args, "stpuppeteer_config", None),
+            output_dir=args.out,
+            channel_names=_channel_names,
+            display_lut=_display_lut,
         )
 
     if args.stamp_transcripts and model.transcripts_priors is not None:
@@ -558,29 +578,59 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
     display_lut = load_model_display_lut(str(args.model))
     if display_lut is not None and args.bundle:
         try:
-            display_lut["noise_stats"] = calibrate_noise_stats(
-                args.bundle, display_lut=display_lut)
-            print(f"[explain] calibrated noise: "
-                    f"{[(n.get('read_std',0), n.get('shot_k',0)) for n in display_lut['noise_stats']]}")
+            import os as _os
+            if _os.environ.get("XESIM_DISABLE_NOISE", "").strip() == "1":
+                display_lut["noise_stats"] = []
+                print(f"[explain] noise injection disabled (XESIM_DISABLE_NOISE=1)")
+            else:
+                display_lut["noise_stats"] = calibrate_noise_stats(
+                    args.bundle, display_lut=display_lut)
+                print(f"[explain] calibrated noise: "
+                        f"{[(n.get('read_std',0), n.get('shot_k',0)) for n in display_lut['noise_stats']]}")
         except Exception as e:
             print(f"[explain] noise calibration unavailable ({e}); skipping noise injection")
     print(f"[explain] Writing bundle → {args.out}")
-    written = write_bundle(
-        output_dir=args.out,
-        scenes=result["scenes"],
-        render_images=result["stitched_image"],
-        channel_names=channel_names_out,
-        pixel_size_um=float(model.pixel_size),
-        gene_panel_source=gp_src,
-        config=config,
-        rng=rng,
-        overwrite=args.overwrite,
-        target_intensity_stats=target_intensity,
-        target_intensity_quantiles=target_quantiles,
-        intensity_mode=calib_mode,
-        real_bundle_path=args.bundle,
-        display_lut=display_lut,
-    )
+    try:
+        # When the streaming writer ran inside build_scene, the
+        # morphology TIFFs are already on disk. Pass render_images=None
+        # so write_bundle skips the morphology image write step but
+        # still emits parquet/csv/manifest.
+        _render_images = (None
+                          if result.get("morphology_already_written")
+                          else result.get("stitched_image"))
+        written = write_bundle(
+            output_dir=args.out,
+            scenes=result["scenes"],
+            render_images=_render_images,
+            channel_names=channel_names_out,
+            pixel_size_um=float(model.pixel_size),
+            gene_panel_source=gp_src,
+            config=config,
+            rng=rng,
+            overwrite=args.overwrite,
+            target_intensity_stats=target_intensity,
+            target_intensity_quantiles=target_quantiles,
+            intensity_mode=calib_mode,
+            real_bundle_path=args.bundle,
+            display_lut=display_lut,
+            geom_stash=result.get("geom_stash"),
+        )
+        if result.get("morphology_already_written"):
+            written["morphology"] = {
+                "focus": str(Path(args.out) / "morphology_focus" /
+                              "morphology_focus_0000.ome.tif"),
+                "z_stack": str(Path(args.out) / "morphology.ome.tif"),
+                "streamed": True,
+            }
+    finally:
+        # Release the on-disk stitch memmaps (build_scene returned a
+        # tmpdir cleanup callback). Cleanup runs even on writer failure
+        # so we don't leak ~75 GB / run.
+        _cleanup = result.get("stitch_cleanup")
+        if callable(_cleanup):
+            try: _cleanup()
+            except Exception as e:
+                print(f"[explain] stitch cleanup failed: {e}")
     print(f"[explain] Done.")
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
                        indent=2, default=str))

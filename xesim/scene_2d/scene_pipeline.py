@@ -329,6 +329,56 @@ def _drop_ghosts_to_target(
     return out, dropped
 
 
+_EMPTY_LABEL = np.zeros((0, 0), dtype=np.uint16)
+
+
+def _extract_and_strip(scene: Scene2D, geom_stash: dict[str, dict]) -> Scene2D:
+    """Extract a finished tile scene's per-cell geometry into ``geom_stash``
+    (keyed by cell_id) and return a stripped scene whose label masks are
+    freed, so the parent's ``scenes_out`` list does not accumulate them.
+
+    The render is already done; the masks exist only to derive (a) polygons
+    + centroid/area for the boundary/cells tables and (b) the per-molecule
+    ``overlaps_nucleus`` flag for transcripts. We compute both once, per
+    tile, while the mask is still resident — geometry via
+    :func:`extract_scene_geometry` into ``geom_stash`` (keyed by cell_id),
+    and ``overlaps_nucleus`` as a molecule column — then drop the masks.
+    The bundle writer rebuilds the boundary/cells tables from ``geom_stash``
+    reading the *final* cell objects (post-ghost-drop, post-stamp) for
+    type/identity, so ghost-drop and transcript-stamping are handled
+    automatically.
+
+    On full breast (~11.5k tiles) this removes the ~33 GB of accumulated
+    int32 masks from parent RAM — the dominant scaling term. Molecule
+    columns are left untouched so transcripts.parquet stays byte-identical
+    to the legacy mask-reading path.
+    """
+    from dataclasses import replace as _replace
+    from .bundle_writer import extract_scene_geometry
+
+    geom_stash.update(extract_scene_geometry(scene))
+
+    mech = scene.mech_scene
+    mols = scene.molecules
+
+    # Precompute overlaps_nucleus (molecule pixel ∈ a nucleus) while the
+    # nucleus mask is still alive — same math as _build_transcripts_df.
+    if (len(mols) > 0 and "overlaps_nucleus" not in mols.columns
+            and mech.nucleus_label is not None and mech.nucleus_label.size):
+        nuc_lbl = mech.nucleus_label
+        psz = scene.pixel_size
+        px = mols["x"].to_numpy(dtype=np.float64) / psz
+        py = mols["y"].to_numpy(dtype=np.float64) / psz
+        h, w = nuc_lbl.shape
+        px_i = np.clip(np.round(px).astype(np.int64), 0, w - 1)
+        py_i = np.clip(np.round(py).astype(np.int64), 0, h - 1)
+        mols = mols.assign(
+            overlaps_nucleus=(nuc_lbl[py_i, px_i] > 0).astype(np.uint8))
+
+    mech = _replace(mech, cell_label=_EMPTY_LABEL, nucleus_label=_EMPTY_LABEL)
+    return _replace(scene, mech_scene=mech, molecules=mols)
+
+
 def _feather_mask(tile_px: int, overlap_px: int) -> np.ndarray:
     """Linear-ramp feather mask: 1 inside, ramping to 0 at each edge.
 
@@ -394,6 +444,16 @@ def build_scene(
     device: str = "cuda",
     emission_backend: str = "legacy",
     stpuppeteer_config: str | None = None,
+    # Phase 2 streaming-writer plumbing. When `output_dir` is supplied
+    # and the bundle is large enough (or env override is set), the
+    # streaming OME-TIFF writer runs in-line with tile rendering and
+    # there's no separate parent-side stitch buffer. The Phase 1 memmap
+    # path remains the fallback for small bundles.
+    output_dir: "str | Path | None" = None,
+    channel_names: list[str] | None = None,
+    display_lut: dict | None = None,
+    n_morphology_focus_files: int = 4,
+    n_pyramid_levels: int = 8,
 ) -> dict[str, Any]:
     """Build + render a multi-tile scene over ``scene_bounds_um``.
 
@@ -493,9 +553,79 @@ def build_scene(
     # Feather-weighted accumulation: value buffer + weight buffer.
     # At the end, stitched = accum_value / accum_weight.
     feather = _feather_mask(tile_px, overlap_px) if overlap_px > 0 else None
-    accum_value = np.zeros((n_ch, H_total, W_total), dtype=np.float32)
-    accum_weight = np.zeros((H_total, W_total), dtype=np.float32)
+    # Two paths:
+    #   - streaming: tiles flow through xesim.scene_2d.streaming_writer,
+    #     which writes OME-TIFFs strip-by-strip as input rows finalize.
+    #     No parent-side stitch buffer; constant-RAM regardless of
+    #     bundle size. Requires `output_dir` so the writer knows where
+    #     to drop morphology_focus_NNNN.ome.tif + morphology.ome.tif.
+    #   - memmap (Phase 1): full-plane float32 stitch buffer on disk.
+    #     The bundle writer still does its own uint16 conversion +
+    #     pyramid build at the end.
+    # The streaming path is auto-engaged for bundles whose pixel area
+    # exceeds AUTOSTREAM_PIXELS (~1e9). Set XESIM_FORCE_STREAMING_WRITER
+    # to 1/0 to override.
+    from .streaming_writer import (
+        AUTOSTREAM_PIXELS, should_stream, StreamingStitchWriter,
+    )
+    _streaming_enabled = (
+        output_dir is not None
+        and should_stream(n_ch, H_total, W_total))
+    _stream_writer = None
+    accum_value = None
+    accum_weight = None
+    _stitch_tmpdir = None
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    if _streaming_enabled:
+        # Make sure output dir exists; the writer assumes morphology_focus/
+        # is a subdirectory it can create.
+        _Path(output_dir).mkdir(parents=True, exist_ok=True)
+        _ch_names = channel_names or list(
+            model.manifest.get("channel_names") or [])
+        _stream_writer = StreamingStitchWriter(
+            _Path(output_dir),
+            channel_names=_ch_names,
+            n_ch=n_ch,
+            H_total=H_total, W_total=W_total,
+            n_tile_rows=ny, n_tile_cols=nx,
+            tile_px=tile_px, overlap_px=overlap_px, step_px=step_px,
+            pixel_size_um=pixel_size,
+            display_lut=display_lut,
+            intensity_mode=intensity_mode,
+            target_intensity_stats=target_intensity_stats,
+            target_intensity_quantiles=target_intensity_quantiles,
+            n_pyramid_levels=n_pyramid_levels,
+            n_focus_files=n_morphology_focus_files,
+            progress=progress,
+        )
+        if progress:
+            print(f"[build_scene] streaming OME-TIFF writer engaged "
+                  f"(bundle area {n_ch*H_total*W_total/1e9:.2f} G pixels ≥ "
+                  f"{AUTOSTREAM_PIXELS/1e9:.2f} G threshold)", flush=True)
+    else:
+        # The buffers grow with bundle area, not worker count. For
+        # breast-5K (75254×51720×4ch f32 → 58 GB) they overflow RAM
+        # even with one worker. Back them with on-disk memmap so the
+        # kernel's page cache decides what stays resident.
+        _stitch_tmpdir = _tempfile.mkdtemp(prefix="xesim_stitch_")
+        if progress:
+            _stitch_gb = (n_ch * H_total * W_total * 4
+                          + H_total * W_total * 4) / (1 << 30)
+            print(f"[build_scene] stitch buffers on disk: {_stitch_tmpdir}  "
+                  f"({_stitch_gb:.1f} GB float32 memmap)", flush=True)
+        accum_value = np.memmap(
+            _Path(_stitch_tmpdir) / "accum_value.f32",
+            dtype=np.float32, mode="w+",
+            shape=(n_ch, H_total, W_total),
+        )
+        accum_weight = np.memmap(
+            _Path(_stitch_tmpdir) / "accum_weight.f32",
+            dtype=np.float32, mode="w+",
+            shape=(H_total, W_total),
+        )
     scenes_out: list[Scene2D] = []
+    geom_stash: dict[str, dict] = {}     # cell_id -> geometry+polys (masks freed)
     seen_anchor_ids: set[str] = set()    # global anchor-ownership dedupe
     ghost_id_offset = 0
     total_anchors = 0
@@ -534,15 +664,20 @@ def build_scene(
         gc = grid[idx]
         sc = res.scene
         render = res.image.astype(np.float32)[:, :tile_px, :tile_px]
-        y0 = gc.grid_j * step_px
-        x0 = gc.grid_i * step_px
-        if feather is not None:
-            accum_value[:, y0:y0 + tile_px, x0:x0 + tile_px] += (
-                render * feather[None, :, :])
-            accum_weight[y0:y0 + tile_px, x0:x0 + tile_px] += feather
+        if _stream_writer is not None:
+            # Streaming path: hand the tile to the writer. It handles
+            # feather + accumulation + per-strip output internally.
+            _stream_writer.submit_tile(idx, render)
         else:
-            accum_value[:, y0:y0 + tile_px, x0:x0 + tile_px] = render
-            accum_weight[y0:y0 + tile_px, x0:x0 + tile_px] = 1.0
+            y0 = gc.grid_j * step_px
+            x0 = gc.grid_i * step_px
+            if feather is not None:
+                accum_value[:, y0:y0 + tile_px, x0:x0 + tile_px] += (
+                    render * feather[None, :, :])
+                accum_weight[y0:y0 + tile_px, x0:x0 + tile_px] += feather
+            else:
+                accum_value[:, y0:y0 + tile_px, x0:x0 + tile_px] = render
+                accum_weight[y0:y0 + tile_px, x0:x0 + tile_px] = 1.0
         owned = filter_to_owned(
             sc, tile_bounds_um=gc.tile_bounds_um,
             seen_anchor_ids=seen_anchor_ids,
@@ -558,7 +693,7 @@ def build_scene(
         total_ghosts += n_ghost_t
         total_tx_proposed += n_tx_t
         total_mols += int(len(owned.molecules))
-        scenes_out.append(owned)
+        scenes_out.append(_extract_and_strip(owned, geom_stash))
 
     import time as _time
     _t_start = _time.time()
@@ -664,15 +799,23 @@ def build_scene(
             total_ghosts -= ghosts_dropped
             total_mols = sum(int(len(s.molecules)) for s in scenes_out)
 
-    # Feather-weighted normalization. We return the float32 stitched image
-    # directly — calibration to uint16 (if requested) happens at the
-    # bundle-writer boundary, the same as the single-tile `--tile` path.
-    # This unifies all explain paths on a float-output contract and keeps
-    # intermediate buffers free of the per-channel "off"-mode rescale
-    # that destroyed inter-channel ratios.
-    if progress:
-        print(f"[build_scene] feather-normalize (float32 output)…")
-    stitched = (accum_value / np.maximum(accum_weight[None, :, :], 1e-6)).astype(np.float32)
+    # Final morphology assembly. Streaming writer flushes itself; the
+    # memmap path does an in-place divide and returns the buffer.
+    morphology_already_written = False
+    if _stream_writer is not None:
+        if progress:
+            print(f"[build_scene] streaming writer: finalize OME-TIFFs", flush=True)
+        _stream_writer.close()
+        morphology_already_written = True
+        stitched = None    # caller checks morphology_already_written
+    else:
+        if progress:
+            print(f"[build_scene] feather-normalize (float32 output, in-place)…")
+        np.maximum(accum_weight, 1e-6, out=accum_weight)
+        for _ci in range(n_ch):
+            np.divide(accum_value[_ci], accum_weight, out=accum_value[_ci])
+        accum_value.flush()
+        stitched = accum_value
 
     full_bounds_um = (
         sb[0], sb[1],
@@ -680,9 +823,33 @@ def build_scene(
         sb[1] + H_total * pixel_size,
     )
 
+    # Cleanup callback. Either the memmap tmpdir (Phase 1) or the
+    # streaming writer's tmpdir + memmap-backed pyramid intermediates
+    # (Phase 2). The caller (xesim/cli.py _explain_multi_path) invokes
+    # this AFTER write_bundle returns. Deleting earlier corrupts the
+    # writer's reads (for Phase 1) and is harmless (for Phase 2).
+    def _cleanup_stitch() -> None:
+        import shutil as _shutil
+        try:
+            if _stream_writer is not None:
+                _stream_writer.cleanup()
+                if progress:
+                    print(f"[build_scene] streaming tmp removed", flush=True)
+            elif _stitch_tmpdir is not None:
+                _shutil.rmtree(_stitch_tmpdir, ignore_errors=True)
+                if progress:
+                    print(f"[build_scene] stitch tmp removed: {_stitch_tmpdir}",
+                          flush=True)
+        except Exception as e:
+            if progress:
+                print(f"[build_scene] stitch cleanup error: {e}", flush=True)
+
     return {
         "scenes": scenes_out,
+        "geom_stash": geom_stash,
         "stitched_image": stitched,
+        "morphology_already_written": morphology_already_written,
+        "stitch_cleanup": _cleanup_stitch,
         "scene_bounds_um": full_bounds_um,
         "pixel_size_um": pixel_size,
         "tile_size_um": tile_size_um,
