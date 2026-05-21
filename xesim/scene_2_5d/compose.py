@@ -68,7 +68,12 @@ def compose_region_scene_25d(
 
     # 1. Load shared bundle artifacts
     if progress: print("[compose_25d] loading z attrs + template bank + cellAdmix...")
-    z_attrs = load_or_fit_cells_z(bundle_path)
+    # Region-scoped z-fit: a monolithic --tile/--region preview fits z only
+    # over its region (+halo), not the whole bundle (the whole-bundle fit is a
+    # 10-15 min first-touch cost). A complete cache, if present, is used as-is;
+    # the scene-first/whole-bundle path (precompute) keeps the full fit.
+    z_attrs = load_or_fit_cells_z(bundle_path, region_um=region_bounds_um,
+                                  halo_um=cell_pad_um)
     if annotation_path is None:
         # Try default bundle-adjacent annotation location
         cand = Path(bundle_path).parent / "annotations" / "annotation.csv.gz"
