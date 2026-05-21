@@ -55,9 +55,8 @@ def compose_region_scene_25d(
     from .templates import TemplateBank, NucleusBank
     from .seeds import sample_unobserved_seeds
     from .tilt import initialize_tilts, mrf_gibbs_sweep
-    from .bodies_3d import stack_z_labels, emit_molecules_3d
-    from .emit_molecules_priors import emit_molecules_3d_from_priors
-    from .render_multi_z import render_multi_z_dapi, _stamp_nucleus_polygons
+    # SDF tessellation / nucleus stamping / multi-z render / molecule emission
+    # now live in the shared render core (tile_render_core).
 
     rng = rng or np.random.default_rng(0)
     bundle = resolve_bundle(str(bundle_path))
@@ -176,129 +175,43 @@ def compose_region_scene_25d(
             template_ys=np.asarray(row.vertex_y_rel, dtype=np.float32),
         ))
 
-    # 6. Per-z SDF tessellation stack
-    h_tile = int(round((ymax - ymin) / psz))
-    w_tile = int(round((xmax - xmin) / psz))
-    z_slices = np.arange(0.0, imaged_depth_um + 1e-3, z_step_um)
-    if progress: print(f"[compose_25d] tessellate {len(z_slices)} z slices "
-                          f"({h_tile}x{w_tile} px)")
-    stack = stack_z_labels(
-        cells_records, z_slices.tolist(),
-        tile_origin_um=(xmin, ymin),
-        tile_size_px=(h_tile, w_tile), pixel_size_um=psz,
-    )
-
-    # 6.5 Build per-cell nucleus templates (real polygon if available,
-    # else sampled from per-type bank)
+    # 6. Per-cell nucleus templates (real polygon if available, else per-type
+    # bank). Built before the shared render core, which takes them as input.
     nuc_templates: dict = {}
     for c in cells_records:
         if c.cell_id.startswith("__unobs_"):
-            # Sample from bank
-            xs_rel, ys_rel = nuc_bank.sample_template(c.cell_type, zone=None, rng=rng) \
-                if len(nuc_bank.df) > 0 else (None, None)
+            xs_rel, ys_rel = (nuc_bank.sample_template(c.cell_type, zone=None, rng=rng)
+                              if len(nuc_bank.df) > 0 else (None, None))
             if xs_rel is not None:
                 nuc_templates[c.cell_id] = (xs_rel, ys_rel)
         else:
             try:
-                xs_rel, ys_rel = nuc_bank.get_observed_template(c.cell_id)
-                nuc_templates[c.cell_id] = (xs_rel, ys_rel)
+                nuc_templates[c.cell_id] = nuc_bank.get_observed_template(c.cell_id)
             except KeyError:
-                # No nucleus polygon for this cell (8% of cells per audit);
-                # fall back to per-type round nucleus
-                pass
+                pass    # ~8% of cells have no nucleus polygon → round fallback
 
-    # 6.7 Stamp nuclei across z up-front so nl_3d is available for the
-    # priors-aware molecule emitter (EDT-3D compartment placement needs
-    # the nucleus mask). This is what render_multi_z_dapi would do
-    # internally; passing pre_stamped avoids duplicate CPU work.
-    cells_by_idx = {c.cell_idx: c for c in cells_records}
-    cl_3d = stack.astype(np.int32, copy=True)
-    nl_3d = np.zeros_like(cl_3d)
-    for zi in range(len(z_slices)):
-        nl_3d[zi] = _stamp_nucleus_polygons(
-            cells_by_idx, float(z_slices[zi]), nuc_templates,
-            tile_size_px=(h_tile, w_tile), tile_origin_um=(xmin, ymin),
-            pixel_size_um=psz,
-            cell_label_at_z=cl_3d[zi],
-        )
-
-    # 7. Multi-z DAPI render (2.5D-novel contribution: z-stack via SDF
-    # tessellation + per-z nucleus stamping). Random latents per [STRICT
-    # unified-render directive] — the multi-z model.render_batch path
-    # has a label-namespace bug across z planes that breaks per-cell-
-    # index latent lookup; using None falls back to the same N(0,1)
-    # sampling the 2D path uses for unencoded cells.
-    if progress: print(f"[compose_25d] render multi-z DAPI via v21 "
-                          f"({len(nuc_templates)} cells with real nucleus templates)")
-    # Learned axial DAPI profile f(Δz), fit once from the source bundle (cached),
-    # so the z-stack's off-focus planes get the broad smooth envelope real DAPI
-    # has instead of dark/sparse independently-rendered planes.
-    from .axial_profile import fit_axial_dapi_profile
-    axial_profile = fit_axial_dapi_profile(bundle_path)
-    dapi_zstack = render_multi_z_dapi(
-        model, stack, cells_records=cells_records,
-        pixel_size_um=psz, background_mask_sigma=3.0,
-        nucleus_templates=nuc_templates,
-        z_slices_um=z_slices,
-        tile_origin_um=(xmin, ymin),
-        cell_latents=None,
-        target_p99=(1.0 if rescale_dapi else None),
-        pre_stamped=(cl_3d, nl_3d),
-        axial_profile=axial_profile,
+    # 7. Shared per-tile render core: SDF tessellation → nucleus stamp →
+    # multi-z DAPI (+ learned axial profile) → focal explain_region → 3D
+    # molecules. The SAME core scene_first.render_tile_from_shared uses, so
+    # calibration / axial-profile / render params can't diverge between the
+    # monolithic and stitched paths. Owned (for molecule emission) = observed
+    # cells whose centroid is in the tile (not halo); unobserved render but
+    # don't emit.
+    z_slices = np.arange(0.0, imaged_depth_um + 1e-3, z_step_um)
+    owned_cell_ids = set(obs.loc[obs["_owned"], "cell_id"].astype(str))
+    from .tile_render_core import render_25d_tile_core
+    if progress: print(f"[compose_25d] render core: {len(cells_records)} cells, "
+                          f"{len(z_slices)} z slices")
+    core = render_25d_tile_core(
+        model, bundle_path, (xmin, ymin, xmax, ymax),
+        cells_records, nuc_templates, owned_cell_ids,
+        z_slices, psz, rng=rng, rescale_dapi=rescale_dapi,
+        annotation_path=annotation_path, default_mol_per_cell=default_mol_per_cell,
     )
-
-    # 8. Focal-plane 4-channel render via the SETTLED 2D path. Per the
-    # `feedback_unified_render_path_strict` directive: do NOT build a
-    # parallel focal-render code path; call explain_region (the same
-    # function `m.explain` uses) for the same region. This gets us:
-    #   - real cell + nucleus polygon rasterization (NOT z-stamped)
-    #   - encoded latents from the same real image
-    #   - the same background_mask_sigma / latent_scale recipe
-    # The 2.5D-novel contribution remains the z-stack above + 3D
-    # molecule emission below.
-    from ..scene_2d.explain_region import explain_region
-    if progress: print(f"[compose_25d] focal 2D render via explain_region "
-                          f"(unified path)")
-    er = explain_region(
-        model, str(bundle_path),
-        region_bounds_um=(xmin, ymin, xmax, ymax),
-        annotation_path=annotation_path,
-        add_ghosts=False,
-        add_transcript_proposed=False,
-        sample_molecules=False,
-        rng=rng,
-        background_mask_sigma=3.0,
-    )
-    focal_render = er.image    # (C, H, W) float32
-
-    # 9. 3D molecule emission — only from cells owned by this tile (centroid
-    # strictly inside the tile). Halo cells render their bodies but don't
-    # emit, so adjacent tiles don't double-emit from boundary-overlapping cells.
-    # Owned = not halo AND not unobserved (observed-only molecule emission
-    # per design decision §6.1 in misc/plan_25d_molecule_port.md; the
-    # scene_first.py whole-bundle path applies the same filter).
-    halo_ids = set(obs.loc[~obs["_owned"], "cell_id"].astype(str).tolist())
-    owned_records = [c for c in cells_records
-                       if c.cell_id not in halo_ids
-                       and not c.cell_id.startswith("__unobs_")]
-    if progress: print(f"[compose_25d] emit 3D molecules from {len(owned_records)}/"
-                          f"{len(cells_records)} cells (halo cells skipped)")
-    tx_priors = getattr(model, "transcripts_priors", None)
-    if tx_priors is not None:
-        molecules = emit_molecules_3d_from_priors(
-            owned_records, cl_3d, nl_3d,
-            z_slices_um=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            transcripts_priors=tx_priors,
-            tx_rate_scale=1.0,
-            rng=rng,
-        )
-    else:
-        molecules = emit_molecules_3d(
-            owned_records, stack, z_slices=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            default_count_per_cell=default_mol_per_cell, rng=rng,
-        )
+    stack = core["stack"]
+    dapi_zstack = core["dapi_zstack"]
+    focal_render = core["focal_render"]
+    molecules = core["molecules"]
 
     # 10. cells_3d table for ground truth
     cells_3d_rows = []

@@ -236,10 +236,8 @@ def render_tile_from_shared(
     keep IPC small; the stitcher doesn't need it).
     """
     from .compose import Compose25DResult
-    from .bodies_3d import stack_z_labels, emit_molecules_3d
-    from .emit_molecules_priors import emit_molecules_3d_from_priors
-    from .render_multi_z import render_multi_z_dapi, _stamp_nucleus_polygons
-    from ..mechanistic_scene import MechanisticScene, MechanisticCell
+    # SDF tessellation / nucleus stamping / multi-z render / molecule emission
+    # now live in the shared render core (tile_render_core).
 
     rng = rng or np.random.default_rng(0)
     xmin, ymin, xmax, ymax = tile_bounds_um
@@ -274,96 +272,30 @@ def render_tile_from_shared(
     if progress: print(f"[scene_first] tile ({xmin:.0f},{ymin:.0f})-({xmax:.0f},{ymax:.0f}) "
                           f"µm: {len(local_cells)} cells ({len(owned_local_ids)} owned)")
 
-    h_tile = int(round((ymax - ymin) / psz))
-    w_tile = int(round((xmax - xmin) / psz))
     z_slices = shared.z_slices_um
 
-    # 2. SDF tessellation over the tile area
-    stack = stack_z_labels(
-        local_cells, z_slices.tolist(),
-        tile_origin_um=(xmin, ymin),
-        tile_size_px=(h_tile, w_tile), pixel_size_um=psz,
-    )
-
-    # 3. Per-cell nucleus templates restricted to local cells
+    # 2. Per-cell nucleus templates restricted to local cells (from the
+    # precomputed shared scene), then the SHARED per-tile render core — the
+    # same core compose_region_scene_25d uses (SDF tessellation → nucleus
+    # stamp → multi-z DAPI + learned axial profile → focal explain_region →
+    # 3D molecules). scene_first's only distinction is the assemble-once-
+    # globally scene; the per-tile render must not diverge from compose.
     nuc_templates: dict = {}
     for c in local_cells:
         tmpl = shared.nuc_templates_by_id.get(c.cell_id)
         if tmpl is not None:
             nuc_templates[c.cell_id] = tmpl
 
-    # 3.5 Stamp nuclei across z up-front so nl_3d is in scope for the
-    # priors-aware molecule emitter (which needs nucleus voxels for EDT-3D
-    # compartment placement). Pre-stamping is what render_multi_z_dapi
-    # would do internally — passing pre_stamped avoids duplicate CPU work.
-    cells_by_idx = {c.cell_idx: c for c in local_cells}
-    cl_3d = stack.astype(np.int32, copy=True)
-    nl_3d = np.zeros_like(cl_3d)
-    for zi in range(len(z_slices)):
-        nl_3d[zi] = _stamp_nucleus_polygons(
-            cells_by_idx, float(z_slices[zi]), nuc_templates,
-            tile_size_px=(h_tile, w_tile), tile_origin_um=(xmin, ymin),
-            pixel_size_um=psz,
-            cell_label_at_z=cl_3d[zi],
-        )
-
-    # 4. Multi-z DAPI render — 2.5D-novel contribution (z-stack).
-    # cell_latents=None for the batched multi-z pass (task 9.AS:
-    # label-shift bug). The focal-plane 4-channel render below uses the
-    # SETTLED 2D explain_region path per the strict unified-render
-    # directive — no parallel focal-render code path.
-    from .axial_profile import fit_axial_dapi_profile
-    axial_profile = fit_axial_dapi_profile(shared.bundle_path)
-    dapi_zstack = render_multi_z_dapi(
-        model, stack, cells_records=local_cells,
-        pixel_size_um=psz, background_mask_sigma=3.0,
-        nucleus_templates=nuc_templates,
-        z_slices_um=z_slices,
-        tile_origin_um=(xmin, ymin),
-        cell_latents=None,
-        target_p99=(1.0 if rescale_dapi else None),
-        pre_stamped=(cl_3d, nl_3d),
-        axial_profile=axial_profile,
+    from .tile_render_core import render_25d_tile_core
+    core = render_25d_tile_core(
+        model, shared.bundle_path, (xmin, ymin, xmax, ymax),
+        local_cells, nuc_templates, owned_local_ids,
+        z_slices, psz, rng=rng, rescale_dapi=rescale_dapi,
+        annotation_path=None, default_mol_per_cell=default_mol_per_cell,
     )
-
-    # 5. Focal 2D 4-channel render via explain_region (same path 2D
-    # uses). Per feedback_unified_render_path_strict: 2.5D's novel
-    # contribution is the z-stack above; the focal-plane render must
-    # match 2D verbatim (real-poly nucleus_label, encoded latents from
-    # the same code, same background_mask_sigma).
-    from ..scene_2d.explain_region import explain_region
-    er = explain_region(
-        model, shared.bundle_path,
-        region_bounds_um=(xmin, ymin, xmax, ymax),
-        add_ghosts=False,
-        add_transcript_proposed=False,
-        sample_molecules=False,
-        rng=rng,
-        background_mask_sigma=3.0,
-    )
-    focal_render = er.image    # (C, H, W) float32
-
-    # 7. Molecules from owned cells only. Use priors-aware emitter
-    # (per-cell-type negbin counts + EDT-3D compartment placement +
-    # real gene panel) when the model carries transcripts_priors;
-    # otherwise fall back to the flat-count stub.
-    owned_records = [c for c in local_cells if c.cell_id in owned_local_ids]
-    tx_priors = getattr(model, "transcripts_priors", None)
-    if tx_priors is not None:
-        molecules = emit_molecules_3d_from_priors(
-            owned_records, cl_3d, nl_3d,
-            z_slices_um=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            transcripts_priors=tx_priors,
-            tx_rate_scale=1.0,
-            rng=rng,
-        )
-    else:
-        molecules = emit_molecules_3d(
-            owned_records, stack, z_slices=z_slices.tolist(),
-            tile_origin_um=(xmin, ymin), pixel_size_um=psz,
-            default_count_per_cell=default_mol_per_cell, rng=rng,
-        )
+    dapi_zstack = core["dapi_zstack"]
+    focal_render = core["focal_render"]
+    molecules = core["molecules"]
 
     # 8. cells_3d table — only the cells we OWN (centroid strictly in tile);
     # the stitcher will dedupe across tiles
