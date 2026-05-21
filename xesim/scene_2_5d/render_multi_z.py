@@ -117,6 +117,8 @@ def render_multi_z_dapi(
     inner_tile_px: int = 256,       # inner-tile size; smaller because we batch z
     pre_stamped: tuple[np.ndarray, np.ndarray] | None = None,
     # ^ (cl_3d, nl_3d) if nucleus stamping was already done by the producer
+    axial_profile: tuple[np.ndarray, np.ndarray] | None = None,
+    # ^ learned f(Δz) = (dz_um, f_values); re-synthesizes off-focus structure
 ) -> np.ndarray:
     """Render the DAPI channel at each z slice via z-batched bridge tiling.
 
@@ -205,6 +207,18 @@ def render_multi_z_dapi(
             )
             for zi, o in enumerate(outs):
                 out[zi, y0:y1, x0:x1] = o[0, :h_eff, :w_eff].astype(np.float32, copy=False)
+
+    # Axial DAPI structure: each z-plane is rendered independently, so a
+    # nucleus appears only within its hard z-extent and the off-focus planes
+    # are dark/sparse — unlike real DAPI, where each nucleus's signal extends
+    # through z as a broad, smoothly-tapering envelope (system axial response +
+    # 3D chromatin). Re-synthesize that envelope from the learned, bundle-fit
+    # profile f(Δz) (size/type/latent-invariant; see axial_profile.py).
+    if axial_profile is not None and n_z > 1 and z_slices_um is not None \
+            and len(z_slices_um) > 1:
+        from .axial_profile import apply_axial_dapi_profile
+        out = apply_axial_dapi_profile(out, np.asarray(z_slices_um),
+                                       axial_profile, float(pixel_size_um))
 
     if target_p99 is not None and out.size > 0:
         nz_pixels = out[out > 0]

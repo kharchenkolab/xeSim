@@ -230,6 +230,11 @@ def compose_region_scene_25d(
     # sampling the 2D path uses for unencoded cells.
     if progress: print(f"[compose_25d] render multi-z DAPI via v21 "
                           f"({len(nuc_templates)} cells with real nucleus templates)")
+    # Learned axial DAPI profile f(Δz), fit once from the source bundle (cached),
+    # so the z-stack's off-focus planes get the broad smooth envelope real DAPI
+    # has instead of dark/sparse independently-rendered planes.
+    from .axial_profile import fit_axial_dapi_profile
+    axial_profile = fit_axial_dapi_profile(bundle_path)
     dapi_zstack = render_multi_z_dapi(
         model, stack, cells_records=cells_records,
         pixel_size_um=psz, background_mask_sigma=3.0,
@@ -239,6 +244,7 @@ def compose_region_scene_25d(
         cell_latents=None,
         target_p99=(1.0 if rescale_dapi else None),
         pre_stamped=(cl_3d, nl_3d),
+        axial_profile=axial_profile,
     )
 
     # 8. Focal-plane 4-channel render via the SETTLED 2D path. Per the
