@@ -231,11 +231,125 @@ def _plot_training_loss(training_log: Path, out_dir: Path) -> Path:
 # explain diagnostics — orchestrator
 
 
-# Tile-scale 3-panel bench regions (real | m.render | saved bundle)
-STANDARD_REGIONS: list[tuple[tuple[float, float, float, float], str]] = [
-    ((1750, 1300, 2240, 1790), "ductal_mixed"),
-    ((6289, 2018, 6779, 2508), "endocrine_islet"),
-]
+def select_bench_regions(
+    cells_df,
+    scene_bounds: tuple[float, float, float, float] | None = None,
+    n: int = 4,
+    size_um: float = 490.0,
+    min_cells: int = 25,
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Pick ``n`` diverse, bench-scale (``size_um`` square) regions for the A3
+    panel — deterministically, from 10x cell calls.
+
+    Stability: a pure function of the real cell centroids (no RNG), so the
+    same bundle + crop config yields the same regions every run. Diversity:
+    farthest-point sampling over standardized features
+    ``[center_x, center_y, log density, mean transcript_count, mean cell_area]``
+    seeded at the densest window — so the set spans both space and local
+    tissue regime (dense ↔ sparse, transcript/area variation). Labels are
+    tissue-neutral (``region1``…``regionN``, sorted densest→sparsest).
+
+    ``scene_bounds`` (global µm xmin,ymin,xmax,ymax) restricts candidates to a
+    region bundle's rendered extent; None ⇒ the full cell extent.
+    """
+    xs = np.asarray(cells_df["x_centroid"], dtype=float)
+    ys = np.asarray(cells_df["y_centroid"], dtype=float)
+    n_all = len(xs)
+    tx = np.asarray(
+        cells_df["transcript_counts"] if "transcript_counts" in cells_df
+        else cells_df["total_counts"] if "total_counts" in cells_df
+        else np.zeros(n_all), dtype=float)
+    ar = np.asarray(
+        cells_df["cell_area"] if "cell_area" in cells_df else np.zeros(n_all),
+        dtype=float)
+    if scene_bounds is not None:
+        bx0, by0, bx1, by1 = (float(v) for v in scene_bounds)
+    else:
+        bx0, by0, bx1, by1 = xs.min(), ys.min(), xs.max(), ys.max()
+
+    # Overlapping candidate grid (stride = size/2) fully inside the extent.
+    stride = size_um / 2.0
+    gx = np.arange(bx0, max(bx0, bx1 - size_um) + 1e-6, stride)
+    gy = np.arange(by0, max(by0, by1 - size_um) + 1e-6, stride)
+    if gx.size == 0:
+        gx = np.array([bx0])
+    if gy.size == 0:
+        gy = np.array([by0])
+
+    rows = []  # x0, y0, cx, cy, count, mean_tx, mean_area
+    for wy in gy:
+        for wx in gx:
+            m = (xs >= wx) & (xs < wx + size_um) & (ys >= wy) & (ys < wy + size_um)
+            c = int(m.sum())
+            if c < min_cells:
+                continue
+            rows.append((wx, wy, wx + size_um / 2, wy + size_um / 2, c,
+                         float(tx[m].mean()), float(ar[m].mean())))
+
+    if not rows:
+        # No cell-dense window (tiny / sparse scope): one centered window so
+        # A3 still renders something rather than skipping silently.
+        cx, cy = 0.5 * (bx0 + bx1), 0.5 * (by0 + by1)
+        h = size_um / 2
+        return [((cx - h, cy - h, cx + h, cy + h), "region1")]
+
+    C = np.asarray(rows, dtype=float)
+    # Adaptive density floor: drop near-background / edge windows (too sparse
+    # to judge render fidelity) by keeping windows at or above the 40th
+    # percentile of populated-window counts — but only if that still leaves
+    # enough candidates. Diversity then comes from the *populated* density
+    # range + composition + space, not from picking empty tissue edges.
+    if len(C) > n:
+        thr = np.percentile(C[:, 4], 40)
+        keep = C[:, 4] >= thr
+        if int(keep.sum()) >= n:
+            C = C[keep]
+    feats = np.stack([C[:, 2], C[:, 3], np.log1p(C[:, 4]), C[:, 5], C[:, 6]], axis=1)
+    sd = feats.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = (feats - feats.mean(axis=0)) / sd
+
+    n_pick = min(n, len(rows))
+    chosen = [int(np.argmax(C[:, 4]))]            # seed: densest window
+    dist = np.linalg.norm(Z - Z[chosen[0]], axis=1)
+    while len(chosen) < n_pick:
+        nxt = int(np.argmax(dist))
+        chosen.append(nxt)
+        dist = np.minimum(dist, np.linalg.norm(Z - Z[nxt], axis=1))
+
+    chosen.sort(key=lambda i: -C[i, 4])           # densest → sparsest
+    out = []
+    for rank, idx in enumerate(chosen):
+        x0, y0 = C[idx, 0], C[idx, 1]
+        out.append(((x0, y0, x0 + size_um, y0 + size_um), f"region{rank + 1}"))
+    return out
+
+
+def load_regions_file(path) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Parse an explicit A3 regions file → ``[(bounds, label), ...]`` (global µm).
+
+    JSON: a list (or ``{"regions": [...]}``) of objects, each either
+    ``{"name", "xmin", "ymin", "xmax", "ymax"}`` or ``{"name", "bounds": [..]}``.
+    CSV: header row ``name,xmin,ymin,xmax,ymax``.
+    """
+    p = Path(path)
+    txt = p.read_text()
+    out: list[tuple[tuple[float, float, float, float], str]] = []
+    if p.suffix.lower() == ".json" or txt.lstrip()[:1] in ("[", "{"):
+        data = json.loads(txt)
+        if isinstance(data, dict):
+            data = data.get("regions", [])
+        for i, e in enumerate(data):
+            b = ([float(v) for v in e["bounds"]] if "bounds" in e
+                 else [float(e[k]) for k in ("xmin", "ymin", "xmax", "ymax")])
+            out.append((tuple(b), str(e.get("name", f"region{i + 1}"))))
+    else:
+        import csv
+        import io
+        for i, row in enumerate(csv.DictReader(io.StringIO(txt))):
+            b = [float(row[k]) for k in ("xmin", "ymin", "xmax", "ymax")]
+            out.append((tuple(b), str(row.get("name") or f"region{i + 1}")))
+    return out
 
 
 def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
@@ -262,7 +376,6 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     synth_dir   = Path(synth_dir)
     model_dir   = Path(model_dir)
     out_dir     = Path(out_dir)
-    regions     = regions or STANDARD_REGIONS
 
     # Scope is a first-class input: read the synth bundle's rendered extent
     # ONCE (single source of truth — bundle_bounds_um) and hand it to every
@@ -272,19 +385,28 @@ def explain_diagnostics(bundle_path: str | Path, synth_dir: str | Path,
     scene_bounds = bundle_bounds_um(synth_dir)
     print(f"[diagnostics] scope: {_scope_label(scene_bounds)}", file=sys.stderr)
 
-    # Restrict A3 bench regions to the rendered extent (region bundles only
-    # cover part of the slide). Keep those that fit; if none do, synthesize
-    # in-bounds bench regions centered in the rendered area.
-    if scene_bounds is not None:
+    # A3 bench regions. Default: data-driven, diverse, stable selection from
+    # the REAL bundle's 10x cell calls (no hard-coded, tissue-specific coords).
+    # Explicit regions (CLI --diagnostic-regions) override; those are kept as
+    # given but filtered to anything overlapping the rendered scope.
+    if regions is None:
+        try:
+            import pandas as pd
+            cdf = pd.read_parquet(bundle_path / "cells.parquet")
+            regions = select_bench_regions(cdf, scene_bounds=scene_bounds)
+            print(f"[diagnostics] A3 regions (data-driven from 10x cell calls): "
+                  f"{[lab for _, lab in regions]}", file=sys.stderr)
+        except Exception as e:
+            print(f"[diagnostics] A3 region selection failed ({e}); "
+                  f"A3 will be skipped", file=sys.stderr)
+            regions = []
+    elif scene_bounds is not None:
         x0b, y0b, x1b, y1b = scene_bounds
         kept = [(b, lab) for (b, lab) in regions
-                if b[0] >= x0b and b[1] >= y0b and b[2] <= x1b and b[3] <= y1b]
-        if not kept:
-            cx, cy = 0.5 * (x0b + x1b), 0.5 * (y0b + y1b)
-            for s, lab in ((300.0, "region_center"), (490.0, "region_wide")):
-                h = s / 2
-                bx0, by0 = max(x0b, cx - h), max(y0b, cy - h)
-                kept.append(((bx0, by0, min(x1b, bx0 + s), min(y1b, by0 + s)), lab))
+                if not (b[2] <= x0b or b[0] >= x1b or b[3] <= y0b or b[1] >= y1b)]
+        for b, lab in regions:
+            if (b, lab) not in kept:
+                _skip("A3", f"region {lab} outside rendered scope")
         regions = kept
 
     # Each panel is independent and writes its own PNG(s), so they run in
@@ -1276,5 +1398,6 @@ __all__ = [
     "fit_model_diagnostics",
     "fit_priors_diagnostics",
     "explain_diagnostics",
-    "STANDARD_REGIONS",
+    "select_bench_regions",
+    "load_regions_file",
 ]

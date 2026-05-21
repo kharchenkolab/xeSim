@@ -618,13 +618,21 @@ def _explain_multi_path(model, args, bounds, rng) -> None:
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
                        indent=2, default=str))
     if getattr(args, "diagnostic", None) is not None:
-        from .diagnostics import resolve_diagnostic_dir, explain_diagnostics
+        from .diagnostics import (resolve_diagnostic_dir, explain_diagnostics,
+                                  load_regions_file)
         diag_dir = resolve_diagnostic_dir(args.diagnostic, args.out)
+        regions = None
+        rfile = getattr(args, "diagnostic_regions", None)
+        if rfile:
+            regions = load_regions_file(rfile)
+            print(f"[explain] A3 regions from {rfile}: "
+                  f"{[lab for _, lab in regions]}")
         print(f"[explain] writing diagnostics → {diag_dir}")
         for p in explain_diagnostics(bundle_path=args.bundle,
                                           synth_dir=args.out,
                                           model_dir=args.model,
-                                          out_dir=diag_dir):
+                                          out_dir=diag_dir,
+                                          regions=regions):
             print(f"  {p}")
 
 
@@ -829,6 +837,11 @@ def build_parser() -> argparse.ArgumentParser:
     diag_parent.add_argument(
         "--no-diagnostic", dest="diagnostic", action="store_const", const=None,
         help="disable the default diagnostic output.")
+    diag_parent.add_argument(
+        "--diagnostic-regions", default=None, metavar="FILE",
+        help="explicit A3 bench regions (JSON list of {name,xmin,ymin,xmax,"
+             "ymax} or CSV name,xmin,ymin,xmax,ymax; global µm). Default: "
+             "diverse regions chosen automatically from the bundle's 10x cells.")
 
     sub = p.add_subparsers(dest="command", required=True)
 
