@@ -16,7 +16,13 @@ These examples use the included pancreas reference config at
 and the `xesim_v21_model` fitted model. Adjust paths to your local
 setup.
 
-**Single-tile 2D explain (~1 minute):**
+**Default to 2D.** `xesim explain` runs in 2D (`--scene-mode 2d`) unless
+you ask for `2.5d`. 2D is the recommended path for STpuppeteer emission:
+it's **3–4× faster** than 2.5D and produces the same configurable
+per-cell-type transcript counts and leakage. Reach for 2.5D only when you
+specifically need 3D molecule z-coordinates / a multi-z DAPI stack.
+
+**Single-tile 2D explain — recommended (~1 minute):**
 
 ```bash
 xesim explain /workspace/Xenium_pancreas_membrane_377/data \
@@ -28,7 +34,9 @@ xesim explain /workspace/Xenium_pancreas_membrane_377/data \
     --device cpu
 ```
 
-**300 × 300 µm 2.5D region (~4 minutes on CPU):**
+**300 × 300 µm 2.5D region — optional, ~3–4× slower (~4 minutes on CPU):**
+
+Only if you need 3D molecule coordinates / a multi-z stack; otherwise prefer 2D above.
 
 ```bash
 xesim explain /workspace/Xenium_pancreas_membrane_377/data \
@@ -44,8 +52,8 @@ xesim explain /workspace/Xenium_pancreas_membrane_377/data \
 **Re-emit on an existing bundle with a different config:**
 
 ```bash
-xesim re-emit-molecules /tmp/pancreas_stp_25d \
-    --out /tmp/pancreas_stp_25d_v2 \
+xesim re-emit-molecules /tmp/pancreas_stp_tile \
+    --out /tmp/pancreas_stp_tile_v2 \
     --stpuppeteer-config tuned_config.yml \
     --seed 1 \
     --use-hard-links \
