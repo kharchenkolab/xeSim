@@ -39,9 +39,15 @@ CPU but is much slower.
 xesim fit-model PATH/TO/BUNDLE --annotations PATH/TO/cell_types.csv \
     --out my_model/
 
-# Re-render the real bundle through the model (2D or 2.5D)
-xesim explain PATH/TO/BUNDLE --model my_model/ --out explained/ \
-    --scene-mode 2d            # or 2.5d for z-stack output
+# Re-render the real bundle through the model. 2D is the default.
+xesim explain PATH/TO/BUNDLE --model my_model/ --out explained/
+
+# Opt in to the 3D z-stack (multi-z DAPI) output. NOTE: 2.5D is several
+# times slower per tile than 2D (it renders a z-stack and re-synthesizes
+# off-focus structure), so start with 2D and use 2.5D only when you need
+# the volumetric morphology.
+xesim explain PATH/TO/BUNDLE --model my_model/ --out explained_25d/ \
+    --scene-mode 2.5d --whole-bundle
 ```
 
 Outputs are written as **standard Xenium bundles** (image stack +
