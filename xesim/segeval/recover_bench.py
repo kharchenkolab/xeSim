@@ -86,8 +86,17 @@ def bench_crop(
     type_names: list[str] | None = None,
     n_realizations: int = 2,
     max_centroid_um: float = 5.0,
+    restrict_to_ablated_region: bool = True,
 ) -> list[dict[str, Any]]:
-    """Run ``n_realizations`` ablate->recover->match trials on one crop."""
+    """Run ``n_realizations`` ablate->recover->match trials on one crop.
+
+    When ``restrict_to_ablated_region`` (default), recovered candidates are kept
+    only if their centroid falls in the dilated footprint of the ablated cells.
+    This de-contaminates precision: a recovered cell in true background or on a
+    genuinely 10x-missed cell is out of scope for *this* benchmark (we only have
+    truth for the cells we removed), so it should not count as spurious. Recall
+    is unaffected (distant proposals never match an ablated truth cell anyway).
+    """
     with np.load(npz_path, allow_pickle=True) as d:
         images = np.asarray(d["images"], dtype=np.float32)
         cl = np.asarray(d["cell_label"], dtype=np.int32)
@@ -111,6 +120,15 @@ def bench_crop(
         truth, ordered = truth_label(cl, labels)
         density = local_density_per_100um2(cl, labels, psz)
         cands = recover_fn(dapi, mem, cl_ab, nl_ab)
+        if restrict_to_ablated_region and cands:
+            from scipy.ndimage import binary_dilation
+            abl_mask = np.isin(cl, list(labels))
+            rad = int(round(max_centroid_um / psz))
+            region = binary_dilation(abl_mask, iterations=max(1, rad))
+            H, W = cl.shape
+            cands = [c for c in cands
+                     if 0 <= int(round(c.cy)) < H and 0 <= int(round(c.cx)) < W
+                     and region[int(round(c.cy)), int(round(c.cx))]]
         rec = candidates_to_label(cands, cl.shape)
         pairs, summ = match_segmentations(truth, rec, pixel_size_um=psz,
                                           max_centroid_um=max_centroid_um)
