@@ -62,15 +62,24 @@ def real_tile_image(
         # hint, OmeCropReader decompresses + caches the ENTIRE morphology plane
         # (~31 GB for a breast bundle) just to crop a small tile — so several
         # one-off region reads (diagnostics A2/A4/D10 in parallel) OOM the box.
-        # Scope the read to the crop's local pixel bbox; restore the prior hint
-        # afterward (set_region_hint also clears the cache, freeing the region).
-        x0, x1, y0, y1 = crop_pixel_bounds(crop, bundle.pixel_size, shape=None)
-        _prev_hint = _imgmod._REGION_HINT_BBOX_PX
-        set_region_hint((y0, y1, x0, x1))
-        try:
+        # Scope the read to the crop's local pixel bbox.
+        #
+        # BUT only do this when no region hint is already active. In the synth
+        # render, build_scene workers set a covering region hint once and warm
+        # the plane cache; explain_region calls us per tile, so overriding the
+        # hint here would clear that cache every tile (set_region_hint drops it)
+        # and re-decompress the worker region — a ~3x whole-bundle slowdown.
+        # When a hint is already set, the worker's cached region covers this
+        # crop: read straight from it, leaving the cache warm.
+        if _imgmod._REGION_HINT_BBOX_PX is None:
+            x0, x1, y0, y1 = crop_pixel_bounds(crop, bundle.pixel_size, shape=None)
+            set_region_hint((y0, y1, x0, x1))
+            try:
+                img = np.asarray(reader.read(crop), dtype=np.float32)
+            finally:
+                set_region_hint(None)
+        else:
             img = np.asarray(reader.read(crop), dtype=np.float32)
-        finally:
-            set_region_hint(_prev_hint)
         if img.size == 0:
             return None
         if display_lut is not None:
