@@ -257,5 +257,8 @@ region panels are visible here cell by cell.
 - **2D:** production-ready, used as the default for whole-bundle output.
   The bundle writer is round-trip faithful: the saved bundle's pixels
   match what the renderer produces directly.
-- **2.5D:** functional. Consumes the per-type 3D priors from
-  `priors_3d/nucleus_priors.json` (single-median fallback if absent).
+- **2.5D:** functional, opt-in (`--scene-mode 2.5d`). Consumes the per-type
+  3D priors from `priors_3d/nucleus_priors.json` (single-median fallback if
+  absent). Several times slower per tile than 2D (renders a 12-plane DAPI
+  z-stack with re-synthesized off-focus structure) and memory caps its worker
+  count on large bundles — start with 2D and use 2.5D only when you need depth.

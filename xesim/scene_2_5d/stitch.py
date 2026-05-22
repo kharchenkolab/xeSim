@@ -35,6 +35,7 @@ def _worker_init(model_path: str, device: str, shared,
     from ..model import XesimModel
     _WORKER_MODEL = XesimModel.load(model_path, device=device)
     _WORKER_SHARED = shared
+    _set_scene_region_hint(shared)
     if compile_renderer:
         try:
             import torch
@@ -45,6 +46,34 @@ def _worker_init(model_path: str, device: str, shared,
             )
         except Exception as e:
             print(f"[worker] torch.compile failed (continuing without): {e}", flush=True)
+
+
+def _set_scene_region_hint(shared) -> None:
+    """Warm the morphology plane cache for this scene's region.
+
+    The 2.5D focal render calls ``real_tile_image`` (via ``explain_region``)
+    once per tile. Without a region hint that read re-decodes the JPEG-XR
+    tiles on every call (d96db0b's per-call scoping → ~3x stitch slowdown).
+    Setting the hint to the scene bounds caches that region once, so every
+    tile slices from RAM. The cache is ~px·4ch·2B per worker, so we only warm
+    when it fits a budget — a sub-region stitch (small) and a pancreas whole
+    bundle (~3.8 GB) qualify; a breast whole-bundle full plane (~32 GB) does
+    not, and falls back to per-tile reads so high worker counts can't OOM."""
+    from ..images import set_region_hint, crop_pixel_bounds
+    from ..models import CropBox
+    from ..scene_2d.render_tile import bundle_origin_um
+    _MAX_CACHE_BYTES = 8e9               # ~1 G px across 4 uint16 channels
+    try:
+        xmin, ymin, xmax, ymax = shared.scene_bounds_um
+        ox, oy = bundle_origin_um(shared.bundle_path)
+        crop = CropBox(xmin=xmin - ox, xmax=xmax - ox,
+                        ymin=ymin - oy, ymax=ymax - oy, crop_id="scene_hint")
+        x0, x1, y0, y1 = crop_pixel_bounds(crop, shared.pixel_size_um, shape=None)
+        if (y1 - y0) * (x1 - x0) * 4 * 2 > _MAX_CACHE_BYTES:
+            return                       # too big to cache safely → per-tile reads
+        set_region_hint((y0, y1, x0, x1))
+    except Exception:
+        pass
 
 
 def _worker_render_tile(arg):
@@ -298,6 +327,10 @@ def build_scene_25d(
     )
 
     if num_workers <= 1:
+        # Serial path runs in this process: warm the plane cache for the
+        # scene region (same reason as the worker init), clear it after so
+        # the scoped hint doesn't leak into later reads / the writer.
+        _set_scene_region_hint(shared)
         for idx, ta in enumerate(tile_args):
             k_, bbox, seed = ta
             res = render_tile_from_shared(
@@ -343,6 +376,11 @@ def build_scene_25d(
                 done += 1
                 if progress:
                     _emit_progress(done, len(tile_args), _t_start, _milestone)
+
+    # Drop the scene region hint (set by the serial path in this process;
+    # workers are separate processes that exit with the pool).
+    from ..images import set_region_hint as _clear_hint
+    _clear_hint(None)
 
     # Normalize focal_render by weight
     focal_render = focal_render / np.maximum(focal_weight[None, :, :], 1e-6)

@@ -188,6 +188,12 @@ look/
 
 ### 2.5D (z-stack) output
 
+> **2D is the default; reach for 2.5D only when you need depth.** 2.5D is
+> several times slower per tile than 2D — it renders a full DAPI z-stack and
+> re-synthesizes off-focus structure at every plane. Expect roughly **1–2 h for
+> a pancreas-scale whole bundle at 2 workers**, versus ~20 min in 2D. Prototype
+> on a small `--region` first.
+
 Pass `--scene-mode 2.5d` to render a **multi-z DAPI stack** (12 planes
 by default, 3 µm step across 33 µm of depth) alongside the focal-plane
 4-channel morphology. Per-cell 3D tilt + extent are sampled from the
@@ -206,8 +212,10 @@ xesim explain PATH/TO/BUNDLE --model my_model/ --out full_25d/ \
 2.5D outputs are standard Xenium-format bundles **plus** the extra
 DAPI z-stack in `morphology.ome.tif` and 3D per-molecule coordinates
 (`x_location`, `y_location`, `z_location`) in `transcripts.parquet`.
-Wall time for a typical pancreas-scale bundle is ~45–50 min at 3 GPU
-workers; multi-z DAPI dominates the runtime vs the 2D path.
+The multi-z DAPI render (12 planes/tile) dominates runtime — this is the
+inherent cost of 2.5D over 2D. Whole-bundle memory caps the practical
+worker count (~2 for a breast-scale plane on a 128 GB box), so 2.5D does
+not parallelize as freely as 2D.
 
 Stitch knobs (whole-bundle / large regions):
 
