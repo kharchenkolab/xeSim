@@ -147,9 +147,9 @@ def apply_axial_dapi_profile(
     fills the off-focus planes the way real DAPI z-stacks look, without
     distorting the in-focus plane (Δz=0 → f=1, no lateral spread).
     """
-    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import gaussian_filter, zoom
     dz_grid, f_vals = profile
-    nz = zstack.shape[0]
+    nz, H, W = zstack.shape
     z_step = float(z_slices_um[1] - z_slices_um[0]) if len(z_slices_um) > 1 else 3.0
 
     def f_interp(dz_um):
@@ -158,16 +158,53 @@ def apply_axial_dapi_profile(
     P = zstack.max(axis=0)                 # in-focus projection
     ZC = zstack.argmax(axis=0)             # in-focus depth (z index) per pixel
     out = np.zeros_like(zstack)
+
+    # The per-(d,z) blur is the hot path (12x12 gaussian_filter on full tiles
+    # = ~85% of 2.5D per-tile time). Two-tier scheme keeps it faithful but cheap:
+    #   - near-focus planes (small sigma) blur at FULL res — exact, and cheap
+    #     because the kernel radius is tiny;
+    #   - far-focus planes (large sigma) are heavily diffuse, so blurring a
+    #     4x-downsampled source and upsampling is visually indistinguishable
+    #     while costing ~16x less per blur (and the sigma shrinks 4x too).
+    DS = 4
+    FULLRES_SIG_PX = 8.0                    # below this, blur at full res
+    Hs, Ws = (H + DS - 1) // DS, (W + DS - 1) // DS
+
+    def _down(a):                          # block-mean downsample (intensity-preserving)
+        ap = np.zeros((Hs * DS, Ws * DS), dtype=np.float32)
+        ap[:H, :W] = a
+        return ap.reshape(Hs, DS, Ws, DS).mean(axis=(1, 3))
+
+    out_s = np.zeros((nz, Hs, Ws), dtype=np.float32)  # far-focus accumulator (low-res)
+    any_far = False
     for d in range(nz):                    # bin pixels by their in-focus depth
-        src = np.where(ZC == d, P, 0.0)
+        src = np.where(ZC == d, P, 0.0).astype(np.float32, copy=False)
         if src.max() <= 0:
             continue
+        src_s = None
         for z in range(nz):
+            if z == d:
+                out[z] += f_interp(0.0) * src      # in-focus: exact, full res
+                continue
             w = f_interp((z - d) * z_step)
             if w <= 1e-4:
                 continue
             sig = lateral_um_per_um * abs(z - d) * z_step / pixel_size_um
-            out[z] += w * (src if sig < 0.3 else gaussian_filter(src, sig))
+            if sig < FULLRES_SIG_PX:
+                out[z] += w * (src if sig < 0.3 else gaussian_filter(src, sig))
+            else:
+                if src_s is None:
+                    src_s = _down(src)
+                out_s[z] += w * gaussian_filter(src_s, sig / DS)
+                any_far = True
+
+    if any_far:
+        for z in range(nz):
+            if out_s[z].max() <= 0:
+                continue
+            up = zoom(out_s[z], DS, order=1)[:H, :W]
+            out[z] += up
+
     if floor_frac > 0:
         out += (floor_frac * gaussian_filter(P, 12.0))[None]
     return out
