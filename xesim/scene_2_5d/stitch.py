@@ -55,18 +55,22 @@ def _set_scene_region_hint(shared) -> None:
     once per tile. Without a region hint that read re-decodes the JPEG-XR
     tiles on every call (d96db0b's per-call scoping → ~3x stitch slowdown).
     Setting the hint to the scene bounds caches that region once, so every
-    tile slices from RAM. For a sub-region stitch this is the small region;
-    for a whole-bundle stitch it is the full plane (~32 GB / worker for a
-    breast bundle — keep whole-bundle 2.5D at <=2 workers, as before)."""
+    tile slices from RAM. The cache is ~px·4ch·2B per worker, so we only warm
+    when it fits a budget — a sub-region stitch (small) and a pancreas whole
+    bundle (~3.8 GB) qualify; a breast whole-bundle full plane (~32 GB) does
+    not, and falls back to per-tile reads so high worker counts can't OOM."""
     from ..images import set_region_hint, crop_pixel_bounds
     from ..models import CropBox
     from ..scene_2d.render_tile import bundle_origin_um
+    _MAX_CACHE_BYTES = 8e9               # ~1 G px across 4 uint16 channels
     try:
         xmin, ymin, xmax, ymax = shared.scene_bounds_um
         ox, oy = bundle_origin_um(shared.bundle_path)
         crop = CropBox(xmin=xmin - ox, xmax=xmax - ox,
                         ymin=ymin - oy, ymax=ymax - oy, crop_id="scene_hint")
         x0, x1, y0, y1 = crop_pixel_bounds(crop, shared.pixel_size_um, shape=None)
+        if (y1 - y0) * (x1 - x0) * 4 * 2 > _MAX_CACHE_BYTES:
+            return                       # too big to cache safely → per-tile reads
         set_region_hint((y0, y1, x0, x1))
     except Exception:
         pass
