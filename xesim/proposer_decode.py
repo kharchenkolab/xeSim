@@ -265,6 +265,62 @@ def propose_latent_cells_learned(
     return candidates
 
 
+def propose_latent_cells_iterative(
+    real_dapi: np.ndarray,
+    real_membrane: np.ndarray,
+    cell_label: np.ndarray,
+    nucleus_label: np.ndarray,
+    proposer: dict[str, Any],
+    *,
+    thresholds: tuple[float, ...] = (0.7, 0.5, 0.3),
+    nms_size: int = 21,
+    dedup_distance_px: float = 6.0,
+    **kw: Any,
+) -> list[CandidateCell]:
+    """Iterative propose -> condition -> propose decode (reseg.md sec 5, C4a).
+
+    Wraps the single-shot :func:`propose_latent_cells_learned` in a most-certain-
+    first cascade: at each (descending) threshold, decode candidates, then
+    **rasterize the accepted cells back into the scaffold** (``cell_label`` /
+    ``nucleus_label``) so the next pass sees them as context and the
+    extracellular guard stops it re-proposing them. This makes recovery joint —
+    cells tile space and don't double-count — and progressively rebuilds the
+    scaffold inside a cleared cluster, the regime where a single pass plateaus.
+
+    Returns the union of accepted candidates (deduplicated by centroid).
+    """
+    scaffold_cl = cell_label.astype(np.int32, copy=True)
+    scaffold_nl = nucleus_label.astype(np.int32, copy=True)
+    next_lab = int(scaffold_cl.max()) + 1
+    accepted: list[CandidateCell] = []
+    centers = np.zeros((0, 2), dtype=np.float32)
+
+    for th in thresholds:
+        cands = propose_latent_cells_learned(
+            real_dapi, real_membrane, scaffold_cl, scaffold_nl, proposer,
+            threshold=th, nms_size=nms_size, **kw)
+        for cand in cands:
+            if centers.shape[0] > 0:
+                d = np.sqrt(((centers[:, 0] - cand.cy) ** 2 +
+                             (centers[:, 1] - cand.cx) ** 2))
+                if float(d.min()) < dedup_distance_px:
+                    continue  # already have a cell here
+            # accept + write into the scaffold so later passes condition on it
+            px = cand.cell_pixels
+            if px is None or len(px) == 0:
+                continue
+            ys = px[:, 0].astype(np.int64); xs = px[:, 1].astype(np.int64)
+            scaffold_cl[ys, xs] = next_lab
+            if cand.nucleus_pixels is not None and len(cand.nucleus_pixels):
+                nys = cand.nucleus_pixels[:, 0].astype(np.int64)
+                nxs = cand.nucleus_pixels[:, 1].astype(np.int64)
+                scaffold_nl[nys, nxs] = next_lab
+            next_lab += 1
+            accepted.append(cand)
+            centers = np.vstack([centers, [[cand.cy, cand.cx]]])
+    return accepted
+
+
 def propose_latent_cells_union(
     real_dapi: np.ndarray,
     real_membrane: np.ndarray,
