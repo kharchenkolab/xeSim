@@ -38,6 +38,7 @@ def build_proposer_corpus(
     splits: tuple[str, ...] = ("train", "val", "test"),
     ablation_rates: tuple[float, ...] = (0.10, 0.25, 0.40),
     realizations_per_rate: int = 1,
+    ablation_modes: tuple[str, ...] = ("single",),
     seed: int = 0,
 ) -> dict[str, Any]:
     """Build ablation-pair corpus.
@@ -54,6 +55,7 @@ def build_proposer_corpus(
     """
 
     from .validation import validate_crop_manifest
+    from .segeval.ablation import select_ablation_set
 
     manifest = validate_crop_manifest(canonical_manifest, check_files=True)
     root = canonical_manifest.parent
@@ -68,6 +70,7 @@ def build_proposer_corpus(
     rng = np.random.default_rng(seed)
     inputs_list, present_list, offsets_list, onehot_list = [], [], [], []
     crop_ids_list, splits_list, rates_list, n_ablated_list = [], [], [], []
+    modes_list: list[str] = []
 
     for record in manifest["crops"]:
         if record.get("split") not in splits:
@@ -95,10 +98,16 @@ def build_proposer_corpus(
         H, W = cl_full.shape
 
         for ablation_rate in ablation_rates:
-          for _real_idx in range(int(realizations_per_rate)):
+          for mode in ablation_modes:
+           for _real_idx in range(int(realizations_per_rate)):
             n_ab = max(1, int(round(ablation_rate * len(live))))
-            ab_lbls = rng.choice(live, size=n_ab, replace=False)
-            ab_set = set(int(x) for x in ab_lbls)
+            # single = random independent cells (gap-filling); cluster/region =
+            # spatially-contiguous sets (joint multi-cell regime). See
+            # segeval.ablation + misc/reseg.md.
+            ab_set = select_ablation_set(cl_full, rng, mode=mode, size=n_ab)
+            if not ab_set:
+                continue
+            ab_lbls = np.array(sorted(ab_set))
             ablated_mask_full = np.isin(cl_full, list(ab_set))
 
             cl_ab = cl_full.copy()
@@ -149,7 +158,8 @@ def build_proposer_corpus(
             crop_ids_list.append(crop_id)
             splits_list.append(str(record.get("split")))
             rates_list.append(float(ablation_rate))
-            n_ablated_list.append(int(n_ab))
+            n_ablated_list.append(int(len(ab_lbls)))
+            modes_list.append(str(mode))
 
     inputs_arr = np.stack(inputs_list, axis=0)  # float32 (N, 4, H, W)
     present_arr = np.stack(present_list, axis=0)  # uint8 (N, H, W)
@@ -167,6 +177,7 @@ def build_proposer_corpus(
         splits=np.array(splits_list, dtype=object),
         ablation_rates=np.array(rates_list, dtype=np.float32),
         n_ablated=np.array(n_ablated_list, dtype=np.int32),
+        ablation_modes=np.array(modes_list, dtype=object),
         type_names=np.array(type_names, dtype=object),
     )
     summary = {
