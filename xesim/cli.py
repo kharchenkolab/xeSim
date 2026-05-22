@@ -417,6 +417,28 @@ def _explain_25d(args: argparse.Namespace) -> None:
     print(json.dumps({k: v for k, v in written.items() if k != "config"},
                        indent=2, default=str))
 
+    # Diagnostics (default: --diagnostic auto). The 2.5D bundle's focal-plane
+    # morphology_focus is what these panels read, so the same explain
+    # diagnostics apply as in 2D; without this block 2.5D silently ignored
+    # --diagnostic and shipped bundles with no panels.
+    if getattr(args, "diagnostic", None) is not None:
+        from .diagnostics import (resolve_diagnostic_dir, explain_diagnostics,
+                                  load_regions_file)
+        diag_dir = resolve_diagnostic_dir(args.diagnostic, args.out)
+        regions = None
+        rfile = getattr(args, "diagnostic_regions", None)
+        if rfile:
+            regions = load_regions_file(rfile)
+            print(f"[explain-2.5d] A3 regions from {rfile}: "
+                  f"{[lab for _, lab in regions]}")
+        print(f"[explain-2.5d] writing diagnostics → {diag_dir}")
+        for p in explain_diagnostics(bundle_path=args.bundle,
+                                          synth_dir=args.out,
+                                          model_dir=args.model,
+                                          out_dir=diag_dir,
+                                          regions=regions):
+            print(f"  {p}")
+
 
 def _explain_multi_scene_first(model, args, bounds, rng, nf,
                                    target_intensity, target_quantiles, calib_mode):
